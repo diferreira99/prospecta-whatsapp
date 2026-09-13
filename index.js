@@ -21,7 +21,6 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion,
 } = require('@whiskeysockets/baileys');
 
 const app = express();
@@ -50,10 +49,8 @@ async function startSock() {
   if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
-  const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
-    version,
     auth: state,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
@@ -78,9 +75,9 @@ async function startSock() {
       isConnected = false;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log('[Baileys] Conexão fechada. Reconectar?', shouldReconnect);
+      console.log('[Baileys] Conexão fechada. Código:', statusCode, '| Motivo:', lastDisconnect?.error?.message || 'desconhecido', '| Reconectar?', shouldReconnect);
       if (shouldReconnect) {
-        startSock();
+        setTimeout(() => startSock(), 2000); // pequena espera antes de tentar de novo
       } else {
         console.log('[Baileys] Sessão deslogada. Apague a pasta auth_info e escaneie o QR novamente.');
       }
