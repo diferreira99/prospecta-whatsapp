@@ -13,6 +13,7 @@
   "dependencies": {
     "@whiskeysockets/baileys": "6.7.17",
     "express": "^4.19.2",
+    "cors": "^2.8.5",
     "qrcode": "^1.5.4",
     "pino": "^9.4.0"
   }
