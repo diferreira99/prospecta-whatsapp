@@ -13,6 +13,7 @@
  */
 
 const express = require('express');
+const cors = require('cors');
 const qrcode = require('qrcode');
 const pino = require('pino');
 const path = require('path');
@@ -25,6 +26,7 @@ const {
 } = require('@whiskeysockets/baileys');
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
