@@ -21,6 +21,7 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
+  fetchLatestBaileysVersion,
 } = require('@whiskeysockets/baileys');
 
 const app = express();
@@ -49,8 +50,11 @@ async function startSock() {
   if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+  const { version } = await fetchLatestBaileysVersion();
+  console.log('[Baileys] Usando versão do protocolo WA:', version);
 
   sock = makeWASocket({
+    version,
     auth: state,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
