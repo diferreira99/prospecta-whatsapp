@@ -107,6 +107,30 @@ function toWhatsAppJid(rawPhone) {
 // ---------- Rotas ----------
 
 // Mostra o QR code como imagem no navegador (acesse a URL pública + /qr)
+// Gera um código de pareamento de 8 dígitos — alternativa ao QR code.
+// Use quando não tiver como escanear (ex: só tem o próprio celular em mãos).
+// No WhatsApp: Dispositivos Vinculados → Vincular com número de telefone → digite o código.
+app.post('/pairing-code', checkAuth, async (req, res) => {
+    if (isConnected) {
+        return res.json({ connected: true });
+    }
+    if (!sock) {
+        return res.status(503).json({ error: 'Servidor ainda inicializando, tente novamente em alguns segundos.' });
+    }
+    const { phone } = req.body;
+    if (!phone) {
+        return res.status(400).json({ error: 'Envie "phone" (com DDI, ex: 5511999999999) no corpo da requisição.' });
+    }
+    try {
+        const digits = String(phone).replace(/\D/g, '');
+        const code = await sock.requestPairingCode(digits);
+        res.json({ code });
+    } catch (err) {
+        console.error('[Baileys] Erro ao gerar código de pareamento:', err);
+        res.status(500).json({ error: err.message || 'Erro ao gerar código de pareamento.' });
+    }
+});
+
 app.get('/qr', checkAuth, async (req, res) => {
   if (isConnected) {
     return res.send('<h2>✅ Já está conectado ao WhatsApp.</h2>');
