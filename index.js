@@ -270,6 +270,10 @@ app.post('/send-message', checkAuth, async (req, res) => {
       return res.status(400).json({ error: 'Número de telefone inválido.' });
     }
 
+    console.log('[DIAGNÓSTICO LID] signalRepository existe?', !!sock.signalRepository);
+    console.log('[DIAGNÓSTICO LID] lidMapping existe?', !!sock.signalRepository?.lidMapping);
+    console.log('[DIAGNÓSTICO LID] métodos disponíveis:', sock.signalRepository?.lidMapping ? Object.keys(sock.signalRepository.lidMapping) : 'nenhum');
+
     await sock.sendMessage(jid, { text: message });
     res.json({ success: true, phone, jid });
   } catch (err) {
