@@ -14,6 +14,13 @@
  *   PROSPECTA_USER_ID    -> UUID do usuário no Supabase Auth, pra casar a resposta com o lead certo
  */
 
+// Polyfill: versões recentes do Baileys usam a API global `crypto` (WebCrypto),
+// que só existe nativamente a partir do Node 20. Isso garante que funcione mesmo
+// em Node mais antigo (ex: Node 18 no Railway).
+if (!globalThis.crypto) {
+  globalThis.crypto = require('crypto').webcrypto;
+}
+
 const express = require('express');
 const cors = require('cors');
 const qrcode = require('qrcode');
