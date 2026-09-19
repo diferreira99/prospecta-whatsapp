@@ -46,6 +46,45 @@ const AUTH_FOLDER = path.join(__dirname, 'auth_info');
 const N8N_WEBHOOK_RESPOSTA = process.env.N8N_WEBHOOK_RESPOSTA || 'https://primary-production-c1c7c.up.railway.app/webhook/receber-resposta';
 const PROSPECTA_USER_ID = process.env.PROSPECTA_USER_ID || ''; // UUID do usuário no Supabase Auth (defina no Railway!)
 
+// Mapeamento LID ↔ telefone: essa versão do Baileys não traduz @lid sozinha quando a
+// resposta chega, então guardamos essa tradução ANTES, no momento do envio (quando já
+// sabemos o telefone), consultando sock.onWhatsApp() — que retorna o LID do contato.
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wktvwbmjubiqtbrvnapj.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || ''; // defina no Railway (mesma service_role key usada no n8n)
+
+async function salvarMapeamentoLid(lid, phone) {
+  if (!lid || !phone || !SUPABASE_KEY) return;
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/lid_mapping`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=merge-duplicates'
+      },
+      body: JSON.stringify({ lid, phone, updated_at: new Date().toISOString() })
+    });
+    console.log('[LID MAPPING] salvo:', lid, '->', phone);
+  } catch (e) {
+    console.warn('[LID MAPPING] erro ao salvar:', e.message);
+  }
+}
+
+async function buscarTelefonePorLid(lid) {
+  if (!SUPABASE_KEY) return null;
+  try {
+    const resp = await fetch(`${SUPABASE_URL}/rest/v1/lid_mapping?lid=eq.${encodeURIComponent(lid)}&select=phone&limit=1`, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+    });
+    const data = await resp.json();
+    return Array.isArray(data) && data[0] ? data[0].phone : null;
+  } catch (e) {
+    console.warn('[LID MAPPING] erro ao buscar:', e.message);
+    return null;
+  }
+}
+
 let sock = null;
 let latestQR = null;
 let isConnected = false;
@@ -90,23 +129,20 @@ async function startSock() {
         if (msg.key.remoteJid?.endsWith('@g.us')) continue; // ignora mensagens de grupo
 
         // O WhatsApp às vezes manda o remetente como @lid (Linked ID, privacidade) em vez
-        // do número de telefone direto (@s.whatsapp.net). Quando isso acontece, tentamos
-        // resolver o telefone real de duas formas, na ordem:
-        //   1) remoteJidAlt — campo alternativo que o Baileys às vezes já preenche
-        //   2) sock.signalRepository.lidMapping — tradução interna do Baileys entre LID e telefone
-        // Isso NUNCA vem do Supabase — é uma informação que só o próprio WhatsApp/Baileys tem.
+        // do número de telefone direto (@s.whatsapp.net). Essa versão do Baileys não traduz
+        // isso sozinha, então consultamos a tabela lid_mapping (preenchida no momento do
+        // ENVIO, na rota /send-message, via sock.onWhatsApp) pra achar o telefone real.
         let jidResolvido = msg.key.remoteJidAlt || msg.key.remoteJid || '';
 
         if ((msg.key.remoteJid || '').endsWith('@lid') && !msg.key.remoteJidAlt) {
-          try {
-            const lid = (msg.key.remoteJid || '').split('@')[0];
-            const pn = await sock.signalRepository?.lidMapping?.getPNForLID?.(lid);
-            if (pn) {
-              jidResolvido = pn.includes('@') ? pn : `${pn}@s.whatsapp.net`;
-              console.log('[messages.upsert] LID resolvido via signalRepository:', lid, '->', jidResolvido);
-            }
-          } catch (e) {
-            console.warn('[messages.upsert] Falha ao tentar resolver LID via signalRepository:', e.message);
+          const lid = (msg.key.remoteJid || '').split('@')[0];
+          const phoneEncontrado = await buscarTelefonePorLid(lid);
+          if (phoneEncontrado) {
+            jidResolvido = `${phoneEncontrado}@s.whatsapp.net`;
+            console.log('[messages.upsert] LID resolvido via tabela lid_mapping:', lid, '->', phoneEncontrado);
+          } else {
+            console.warn('[messages.upsert] LID sem mapeamento conhecido ainda (talvez essa pessoa nunca tenha recebido mensagem sua) — ignorando:', msg.key.remoteJid);
+            continue;
           }
         }
 
@@ -277,11 +313,19 @@ app.post('/send-message', checkAuth, async (req, res) => {
       return res.status(400).json({ error: 'Número de telefone inválido.' });
     }
 
-    console.log('[DIAGNÓSTICO LID] signalRepository existe?', !!sock.signalRepository);
-    console.log('[DIAGNÓSTICO LID] lidMapping existe?', !!sock.signalRepository?.lidMapping);
-    console.log('[DIAGNÓSTICO LID] métodos disponíveis:', sock.signalRepository?.lidMapping ? Object.keys(sock.signalRepository.lidMapping) : 'nenhum');
-    console.log('[DIAGNÓSTICO LID] chaves de sock com "lid" no nome:', Object.keys(sock).filter(k => k.toLowerCase().includes('lid')));
-    console.log('[DIAGNÓSTICO LID] chaves de signalRepository com "lid":', sock.signalRepository ? Object.keys(sock.signalRepository).filter(k => k.toLowerCase().includes('lid')) : 'n/a');
+    // Antes de enviar, consulta o LID desse contato (se ele tiver um) e guarda o
+    // mapeamento LID -> telefone. É isso que permite reconhecer a resposta dele
+    // depois, mesmo que ela chegue como @lid em vez do telefone puro.
+    try {
+      const [contato] = await sock.onWhatsApp(jid);
+      if (contato?.lid) {
+        const lidDigits = String(contato.lid).split('@')[0].replace(/\D/g, '');
+        const phoneDigits = String(phone).replace(/\D/g, '');
+        salvarMapeamentoLid(lidDigits, phoneDigits); // fire-and-forget, não trava o envio
+      }
+    } catch (e) {
+      console.warn('[send-message] Não deu pra checar/salvar LID desse contato (envio segue normal):', e.message);
+    }
 
     await sock.sendMessage(jid, { text: message });
     res.json({ success: true, phone, jid });
