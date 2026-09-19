@@ -83,20 +83,35 @@ async function startSock() {
         if (msg.key.remoteJid?.endsWith('@g.us')) continue; // ignora mensagens de grupo
 
         // O WhatsApp às vezes manda o remetente como @lid (Linked ID, privacidade) em vez
-        // do número de telefone direto (@s.whatsapp.net). Quando isso acontece, o Baileys
-        // costuma disponibilizar o número real em remoteJidAlt — tentamos ele primeiro.
-        const jidPreferido = msg.key.remoteJidAlt || msg.key.remoteJid || '';
-        const ehLid = (msg.key.remoteJid || '').endsWith('@lid') && !msg.key.remoteJidAlt;
+        // do número de telefone direto (@s.whatsapp.net). Quando isso acontece, tentamos
+        // resolver o telefone real de duas formas, na ordem:
+        //   1) remoteJidAlt — campo alternativo que o Baileys às vezes já preenche
+        //   2) sock.signalRepository.lidMapping — tradução interna do Baileys entre LID e telefone
+        // Isso NUNCA vem do Supabase — é uma informação que só o próprio WhatsApp/Baileys tem.
+        let jidResolvido = msg.key.remoteJidAlt || msg.key.remoteJid || '';
 
-        if (ehLid) {
-          console.warn('[messages.upsert] Mensagem veio como @lid sem remoteJidAlt disponível — ignorando (não dá pra saber o telefone real):', msg.key.remoteJid);
+        if ((msg.key.remoteJid || '').endsWith('@lid') && !msg.key.remoteJidAlt) {
+          try {
+            const lid = (msg.key.remoteJid || '').split('@')[0];
+            const pn = await sock.signalRepository?.lidMapping?.getPNForLID?.(lid);
+            if (pn) {
+              jidResolvido = pn.includes('@') ? pn : `${pn}@s.whatsapp.net`;
+              console.log('[messages.upsert] LID resolvido via signalRepository:', lid, '->', jidResolvido);
+            }
+          } catch (e) {
+            console.warn('[messages.upsert] Falha ao tentar resolver LID via signalRepository:', e.message);
+          }
+        }
+
+        const aindaEhLid = jidResolvido.endsWith('@lid');
+        if (aindaEhLid) {
+          console.warn('[messages.upsert] Não foi possível resolver o telefone real (veio como @lid) — ignorando esta mensagem:', msg.key.remoteJid);
           continue;
         }
 
-        const phone = jidPreferido.replace('@s.whatsapp.net', '').replace('@lid', '').replace(/\D/g, '');
+        const phone = jidResolvido.replace('@s.whatsapp.net', '').replace(/\D/g, '');
 
-        // Sanidade: telefone BR (com DDI) tem entre 10 e 13 dígitos. Fora disso, provavelmente
-        // não é um telefone de verdade (ex: um ID @lid que passou sem ser filtrado acima).
+        // Sanidade: telefone BR (com DDI) tem entre 10 e 13 dígitos.
         if (!phone || phone.length < 10 || phone.length > 13) {
           console.warn('[messages.upsert] Telefone extraído parece inválido, ignorando:', phone, '| jid original:', msg.key.remoteJid);
           continue;
