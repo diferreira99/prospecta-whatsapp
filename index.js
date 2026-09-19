@@ -273,6 +273,8 @@ app.post('/send-message', checkAuth, async (req, res) => {
     console.log('[DIAGNÓSTICO LID] signalRepository existe?', !!sock.signalRepository);
     console.log('[DIAGNÓSTICO LID] lidMapping existe?', !!sock.signalRepository?.lidMapping);
     console.log('[DIAGNÓSTICO LID] métodos disponíveis:', sock.signalRepository?.lidMapping ? Object.keys(sock.signalRepository.lidMapping) : 'nenhum');
+    console.log('[DIAGNÓSTICO LID] chaves de sock com "lid" no nome:', Object.keys(sock).filter(k => k.toLowerCase().includes('lid')));
+    console.log('[DIAGNÓSTICO LID] chaves de signalRepository com "lid":', sock.signalRepository ? Object.keys(sock.signalRepository).filter(k => k.toLowerCase().includes('lid')) : 'n/a');
 
     await sock.sendMessage(jid, { text: message });
     res.json({ success: true, phone, jid });
