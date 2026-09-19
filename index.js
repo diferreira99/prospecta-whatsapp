@@ -8,8 +8,10 @@
  *   POST /check-number    -> { phone: "5511999999999" } -> { exists: true/false }
  *
  * Variáveis de ambiente:
- *   API_TOKEN  -> token simples para proteger as rotas (defina no Railway)
- *   PORT       -> porta (Railway define automaticamente)
+ *   API_TOKEN            -> token simples para proteger as rotas (defina no Railway)
+ *   PORT                 -> porta (Railway define automaticamente)
+ *   N8N_WEBHOOK_RESPOSTA -> URL do webhook n8n que recebe respostas dos leads (captura, não responde nada)
+ *   PROSPECTA_USER_ID    -> UUID do usuário no Supabase Auth, pra casar a resposta com o lead certo
  */
 
 const express = require('express');
@@ -32,6 +34,10 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || ''; // se vazio, roda sem checagem (defina em produção!)
 const AUTH_FOLDER = path.join(__dirname, 'auth_info');
+
+// Captura de resposta (só escuta e registra — NUNCA responde nada automaticamente)
+const N8N_WEBHOOK_RESPOSTA = process.env.N8N_WEBHOOK_RESPOSTA || 'https://primary-production-c1c7c.up.railway.app/webhook/receber-resposta';
+const PROSPECTA_USER_ID = process.env.PROSPECTA_USER_ID || ''; // UUID do usuário no Supabase Auth (defina no Railway!)
 
 let sock = null;
 let latestQR = null;
@@ -63,6 +69,56 @@ async function startSock() {
   });
 
   sock.ev.on('creds.update', saveCreds);
+
+  // ---------- Captura de RESPOSTAS recebidas (só escuta, NUNCA responde nada automaticamente) ----------
+  // Encaminha pro n8n: telefone + texto + horário. O n8n decide se parece auto-resposta
+  // (URA/robô do WhatsApp Business do próprio lead) e grava tudo no Supabase.
+  // Este listener NUNCA chama sock.sendMessage — não existe resposta automática aqui.
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return; // ignora histórico/sincronização, só mensagens novas em tempo real
+    for (const msg of messages) {
+      try {
+        if (!msg.message) continue;
+        if (msg.key.fromMe) continue; // ignora mensagens que O PRÓPRIO NÚMERO enviou (nossos disparos)
+        if (msg.key.remoteJid?.endsWith('@g.us')) continue; // ignora mensagens de grupo
+
+        const phone = (msg.key.remoteJid || '').replace('@s.whatsapp.net', '').replace(/\D/g, '');
+        if (!phone) continue;
+
+        const texto = msg.message.conversation
+          || msg.message.extendedTextMessage?.text
+          || msg.message.imageMessage?.caption
+          || msg.message.videoMessage?.caption
+          || '';
+
+        const timestampMs = (msg.messageTimestamp ? Number(msg.messageTimestamp) : Math.floor(Date.now() / 1000)) * 1000;
+
+        if (!N8N_WEBHOOK_RESPOSTA || !PROSPECTA_USER_ID) {
+          console.warn('[messages.upsert] N8N_WEBHOOK_RESPOSTA ou PROSPECTA_USER_ID não configurados — resposta recebida mas não encaminhada.');
+          continue;
+        }
+
+        // Node 18+ tem fetch nativo. Se der erro "fetch is not defined", rode:
+        //   npm install node-fetch
+        // e adicione no topo do arquivo: const fetch = require('node-fetch');
+        fetch(N8N_WEBHOOK_RESPOSTA, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            phone,
+            mensagem: texto,
+            recebidoEm: new Date(timestampMs).toISOString(),
+            userId: PROSPECTA_USER_ID
+          })
+        }).then(() => {
+          console.log('[messages.upsert] Resposta encaminhada pro n8n:', phone);
+        }).catch(err => console.error('[messages.upsert] erro ao encaminhar resposta pro n8n:', err.message));
+
+      } catch (err) {
+        console.error('[messages.upsert] erro processando mensagem recebida:', err);
+      }
+    }
+  });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
