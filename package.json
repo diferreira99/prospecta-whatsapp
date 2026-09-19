@@ -1,20 +1,19 @@
 {
-  "name": "prospecta-whatsapp-server",
-  "version": "1.0.1",
-  "description": "Servidor WhatsApp gratuito (Baileys) para substituir o UAZAPI no Prospecta+",
+  "name": "prospecta-whatsapp",
+  "version": "1.0.0",
+  "description": "Servidor WhatsApp gratuito (Baileys) para o Prospecta+",
   "main": "index.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=18"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "6.7.17",
-    "express": "^4.19.2",
+    "@whiskeysockets/baileys": "^6.7.17",
     "cors": "^2.8.5",
-    "qrcode": "^1.5.4",
-    "pino": "^9.4.0"
+    "express": "^4.19.2",
+    "pino": "^9.4.0",
+    "qrcode": "^1.5.4"
   }
 }
