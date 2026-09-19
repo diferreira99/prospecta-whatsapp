@@ -82,8 +82,25 @@ async function startSock() {
         if (msg.key.fromMe) continue; // ignora mensagens que O PRÓPRIO NÚMERO enviou (nossos disparos)
         if (msg.key.remoteJid?.endsWith('@g.us')) continue; // ignora mensagens de grupo
 
-        const phone = (msg.key.remoteJid || '').replace('@s.whatsapp.net', '').replace(/\D/g, '');
-        if (!phone) continue;
+        // O WhatsApp às vezes manda o remetente como @lid (Linked ID, privacidade) em vez
+        // do número de telefone direto (@s.whatsapp.net). Quando isso acontece, o Baileys
+        // costuma disponibilizar o número real em remoteJidAlt — tentamos ele primeiro.
+        const jidPreferido = msg.key.remoteJidAlt || msg.key.remoteJid || '';
+        const ehLid = (msg.key.remoteJid || '').endsWith('@lid') && !msg.key.remoteJidAlt;
+
+        if (ehLid) {
+          console.warn('[messages.upsert] Mensagem veio como @lid sem remoteJidAlt disponível — ignorando (não dá pra saber o telefone real):', msg.key.remoteJid);
+          continue;
+        }
+
+        const phone = jidPreferido.replace('@s.whatsapp.net', '').replace('@lid', '').replace(/\D/g, '');
+
+        // Sanidade: telefone BR (com DDI) tem entre 10 e 13 dígitos. Fora disso, provavelmente
+        // não é um telefone de verdade (ex: um ID @lid que passou sem ser filtrado acima).
+        if (!phone || phone.length < 10 || phone.length > 13) {
+          console.warn('[messages.upsert] Telefone extraído parece inválido, ignorando:', phone, '| jid original:', msg.key.remoteJid);
+          continue;
+        }
 
         const texto = msg.message.conversation
           || msg.message.extendedTextMessage?.text
