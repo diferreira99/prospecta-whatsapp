@@ -5,6 +5,7 @@
  *   GET  /qr              -> mostra o QR code para conectar o WhatsApp (escanear 1x)
  *   GET  /status          -> { connected: true/false }
  *   POST /send-message    -> { phone: "5511999999999", message: "texto" }
+ *   POST /send-document   -> { phone: "5511999999999", base64: "...", filename: "relatorio.pdf", caption: "texto opcional" }
  *   POST /check-number    -> { phone: "5511999999999" } -> { exists: true/false }
  *
  * Variáveis de ambiente:
@@ -332,6 +333,35 @@ app.post('/send-message', checkAuth, async (req, res) => {
   } catch (err) {
     console.error('[send-message] erro:', err);
     res.status(500).json({ error: err.message || 'Erro ao enviar mensagem.' });
+  }
+});
+
+// Envia um documento (ex: PDF de relatório) — recebe o arquivo em base64
+app.post('/send-document', checkAuth, async (req, res) => {
+  try {
+    if (!isConnected || !sock) {
+      return res.status(503).json({ error: 'WhatsApp não conectado ainda. Acesse /qr para conectar.' });
+    }
+    const { phone, base64, filename, caption } = req.body;
+    if (!phone || !base64) {
+      return res.status(400).json({ error: 'Envie "phone" e "base64" no corpo da requisição.' });
+    }
+    const jid = toWhatsAppJid(phone);
+    if (!jid) {
+      return res.status(400).json({ error: 'Número de telefone inválido.' });
+    }
+
+    const buffer = Buffer.from(base64, 'base64');
+    await sock.sendMessage(jid, {
+      document: buffer,
+      fileName: filename || 'relatorio.pdf',
+      mimetype: 'application/pdf',
+      caption: caption || ''
+    });
+    res.json({ success: true, phone, jid });
+  } catch (err) {
+    console.error('[send-document] erro:', err);
+    res.status(500).json({ error: err.message || 'Erro ao enviar documento.' });
   }
 });
 
