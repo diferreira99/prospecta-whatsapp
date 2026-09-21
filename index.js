@@ -37,7 +37,7 @@ const {
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' })); // PDFs/mídias em base64 passam fácil do limite padrão (100kb)
 
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || ''; // se vazio, roda sem checagem (defina em produção!)
@@ -336,13 +336,13 @@ app.post('/send-message', checkAuth, async (req, res) => {
   }
 });
 
-// Envia um documento (ex: PDF de relatório) — recebe o arquivo em base64
+// Envia qualquer tipo de mídia (documento, imagem, áudio, vídeo) — recebe o arquivo em base64
 app.post('/send-document', checkAuth, async (req, res) => {
   try {
     if (!isConnected || !sock) {
       return res.status(503).json({ error: 'WhatsApp não conectado ainda. Acesse /qr para conectar.' });
     }
-    const { phone, base64, filename, caption } = req.body;
+    const { phone, base64, filename, caption, tipo, mimetype } = req.body;
     if (!phone || !base64) {
       return res.status(400).json({ error: 'Envie "phone" e "base64" no corpo da requisição.' });
     }
@@ -352,12 +352,20 @@ app.post('/send-document', checkAuth, async (req, res) => {
     }
 
     const buffer = Buffer.from(base64, 'base64');
-    await sock.sendMessage(jid, {
-      document: buffer,
-      fileName: filename || 'relatorio.pdf',
-      mimetype: 'application/pdf',
-      caption: caption || ''
-    });
+    let payload;
+    if (tipo === 'image') {
+      payload = { image: buffer, mimetype: mimetype || 'image/jpeg', caption: caption || '' };
+    } else if (tipo === 'video') {
+      payload = { video: buffer, mimetype: mimetype || 'video/mp4', caption: caption || '' };
+    } else if (tipo === 'audio') {
+      // ptt:true faz aparecer como nota de voz (bolinha redonda); precisa ser .ogg/opus pra ficar
+      // 100% igual ao nativo, mas outros formatos de áudio o WhatsApp também aceita como arquivo comum.
+      payload = { audio: buffer, mimetype: mimetype || 'audio/ogg; codecs=opus', ptt: true };
+    } else {
+      payload = { document: buffer, fileName: filename || 'arquivo', mimetype: mimetype || 'application/octet-stream', caption: caption || '' };
+    }
+
+    await sock.sendMessage(jid, payload);
     res.json({ success: true, phone, jid });
   } catch (err) {
     console.error('[send-document] erro:', err);
