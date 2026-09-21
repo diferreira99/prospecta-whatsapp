@@ -358,9 +358,12 @@ app.post('/send-document', checkAuth, async (req, res) => {
     } else if (tipo === 'video') {
       payload = { video: buffer, mimetype: mimetype || 'video/mp4', caption: caption || '' };
     } else if (tipo === 'audio') {
-      // ptt:true faz aparecer como nota de voz (bolinha redonda); precisa ser .ogg/opus pra ficar
-      // 100% igual ao nativo, mas outros formatos de áudio o WhatsApp também aceita como arquivo comum.
-      payload = { audio: buffer, mimetype: mimetype || 'audio/ogg; codecs=opus', ptt: true };
+      // ptt:true (nota de voz, bolinha redonda) só funciona de verdade com áudio em
+      // ogg/opus — forçar isso com outro formato (mp3, wav, etc.) fazia o envio falhar
+      // silenciosamente. Se não for ogg/opus, manda como arquivo de áudio normal (ainda
+      // toca certinho no WhatsApp, só não vira a bolinha redonda).
+      const ehOggOpus = (mimetype || '').includes('ogg');
+      payload = { audio: buffer, mimetype: mimetype || 'audio/mpeg', ptt: ehOggOpus };
     } else {
       payload = { document: buffer, fileName: filename || 'arquivo', mimetype: mimetype || 'application/octet-stream', caption: caption || '' };
     }
