@@ -41,7 +41,9 @@ app.use(express.json({ limit: '50mb' })); // PDFs/mídias em base64 passam fáci
 
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || ''; // se vazio, roda sem checagem (defina em produção!)
-const AUTH_FOLDER = path.join(__dirname, 'auth_info');
+// Pasta da sessão do WhatsApp. No Railway, monte um Volume (ex.: em /data) e defina AUTH_DIR=/data/auth_info,
+// senão a sessão se perde a cada novo deploy e é preciso ler o QR de novo. Sem AUTH_DIR, funciona como antes.
+const AUTH_FOLDER = process.env.AUTH_DIR || path.join(__dirname, 'auth_info');
 
 // Captura de resposta (só escuta e registra — NUNCA responde nada automaticamente)
 const N8N_WEBHOOK_RESPOSTA = process.env.N8N_WEBHOOK_RESPOSTA || 'https://primary-production-c1c7c.up.railway.app/webhook/receber-resposta';
@@ -86,6 +88,27 @@ async function buscarTelefonePorLid(lid) {
   }
 }
 
+// ---------- Reenvio de mensagens que o celular não conseguiu abrir ----------
+// Quando um aparelho não consegue abrir uma mensagem, o WhatsApp pede para reenviá-la ("Aguardando mensagem...").
+// Sem a função getMessage o servidor não sabe o conteúdo original e a mensagem fica pendente para sempre.
+// Guardamos as últimas mensagens enviadas em memória (limite de 3000) para atender esse pedido.
+const mensagensEnviadas = new Map();
+const MAX_MENSAGENS = 3000;
+function guardarMensagem(enviada) {
+  try {
+    if (!enviada || !enviada.key || !enviada.key.id || !enviada.message) return;
+    mensagensEnviadas.set(enviada.key.id, enviada.message);
+    if (mensagensEnviadas.size > MAX_MENSAGENS) mensagensEnviadas.delete(mensagensEnviadas.keys().next().value);
+  } catch (e) { /* nunca atrapalha o envio */ }
+}
+const msgRetryCounterCache = {
+  _m: new Map(),
+  get(k) { return this._m.get(k); },
+  set(k, v) { this._m.set(k, v); return true; },
+  del(k) { this._m.delete(k); },
+  flushAll() { this._m.clear(); },
+};
+
 let sock = null;
 let latestQR = null;
 let isConnected = false;
@@ -113,6 +136,9 @@ async function startSock() {
     auth: state,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
+    getMessage: async (key) => mensagensEnviadas.get(key.id) || undefined, // atende o pedido de reenvio
+    msgRetryCounterCache,
+    markOnlineOnConnect: false, // deixa o celular continuar recebendo as notificações normalmente
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -328,7 +354,8 @@ app.post('/send-message', checkAuth, async (req, res) => {
       console.warn('[send-message] Não deu pra checar/salvar LID desse contato (envio segue normal):', e.message);
     }
 
-    await sock.sendMessage(jid, { text: message });
+    const enviada = await sock.sendMessage(jid, { text: message });
+    guardarMensagem(enviada);
     res.json({ success: true, phone, jid });
   } catch (err) {
     console.error('[send-message] erro:', err);
@@ -368,7 +395,8 @@ app.post('/send-document', checkAuth, async (req, res) => {
       payload = { document: buffer, fileName: filename || 'arquivo', mimetype: mimetype || 'application/octet-stream', caption: caption || '' };
     }
 
-    await sock.sendMessage(jid, payload);
+    const enviada = await sock.sendMessage(jid, payload);
+    guardarMensagem(enviada);
     res.json({ success: true, phone, jid });
   } catch (err) {
     console.error('[send-document] erro:', err);
