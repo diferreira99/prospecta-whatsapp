@@ -450,16 +450,36 @@ setInterval(() => {
   supa('DELETE', `grupo_mensagens?user_id=eq.${PROSPECTA_USER_ID}&criado_em=lt.${encodeURIComponent(limite)}`, undefined, 'return=minimal').catch(() => {});
 }, 24 * 60 * 60 * 1000).unref();
 
-// ---------- Middleware simples de autenticação por token ----------
-function checkAuth(req, res, next) {
+// ---------- Middleware de autenticação ----------
+// Dois jeitos de entrar:
+//  1) x-api-token (a automação n8n e o painel do administrador);
+//  2) Authorization: Bearer <login do Supabase> — o app do cliente. Só passa o login do dono deste
+//     servidor (PROSPECTA_USER_ID), então o cliente nunca precisa ver o token do servidor.
+const _loginsOk = new Map();   // token -> expira em (ms); evita perguntar ao Supabase a cada chamada
+async function loginDoDono(jwt) {
+  if (!jwt || !PROSPECTA_USER_ID || !SUPABASE_KEY) return false;
+  const agora = Date.now();
+  const em = _loginsOk.get(jwt);
+  if (em && em > agora) return true;
+  try {
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${jwt}` } });
+    if (!r.ok) return false;
+    const u = await r.json();
+    if (!u || u.id !== PROSPECTA_USER_ID) return false;
+    if (_loginsOk.size > 200) for (const [k, v] of _loginsOk) if (v <= agora) _loginsOk.delete(k);
+    _loginsOk.set(jwt, agora + 5 * 60 * 1000);
+    return true;
+  } catch (e) { return false; }
+}
+async function checkAuth(req, res, next) {
   // Sem API_TOKEN o servidor não atende nada (antes ficava aberto para qualquer um)
   if (!API_TOKEN) return res.status(503).json({ error: 'Servidor sem API_TOKEN configurado.' });
   // O token vai no cabeçalho; pela URL (fica em logs) só na página do QR aberta no navegador
   const token = req.headers['x-api-token'] || (req.path === '/qr' ? req.query.token : undefined);
-  if (token !== API_TOKEN) {
-    return res.status(401).json({ error: 'Token inválido. Envie o header x-api-token.' });
-  }
-  next();
+  if (token && token === API_TOKEN) return next();
+  const jwt = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  if (jwt && await loginDoDono(jwt)) return next();
+  return res.status(401).json({ error: jwt ? 'Login sem acesso a este servidor. Entre de novo no Prospecta+.' : 'Token inválido. Envie o header x-api-token.' });
 }
 
 // ---------- Conexão com o WhatsApp ----------
@@ -972,6 +992,60 @@ app.post('/logout', checkAuth, async (req, res) => {
 });
 
 // Aviso livre para o número de alerta (ex.: automações). Corpo: { texto }
+// ---------- IA pelo servidor ----------
+// O app do cliente não tem mais a chave da IA: pede o texto aqui e o servidor chama a OpenAI/Gemini
+// com a chave que o administrador gravou no banco (user_config).
+let _iaCfg = null, _iaCfgEm = 0;
+async function iaConfig() {
+  if (_iaCfg && Date.now() - _iaCfgEm < 60 * 1000) return _iaCfg;
+  const rows = await supa('GET', `user_config?user_id=eq.${PROSPECTA_USER_ID}&select=ia_provider,openai_key,gemini_key`);
+  _iaCfg = (Array.isArray(rows) && rows[0]) || {};
+  _iaCfgEm = Date.now();
+  return _iaCfg;
+}
+const _iaUso = [];   // horários das últimas chamadas (limite por minuto)
+app.post('/ia', checkAuth, async (req, res) => {
+  try {
+    const prompt = String(req.body?.prompt || '').trim();
+    if (!prompt) return res.status(400).json({ error: 'Envie "prompt".' });
+    if (prompt.length > 20000) return res.status(400).json({ error: 'Texto grande demais para a IA.' });
+    const agora = Date.now();
+    while (_iaUso.length && _iaUso[0] < agora - 60000) _iaUso.shift();
+    if (_iaUso.length >= 60) return res.status(429).json({ error: 'Muitas chamadas de IA em um minuto. Espere um pouco.' });
+    _iaUso.push(agora);
+    if (!SUPABASE_KEY || !PROSPECTA_USER_ID) return res.status(503).json({ error: 'Servidor sem acesso ao banco.' });
+    const cfg = await iaConfig();
+    const pedido = req.body?.provider === 'gemini' || req.body?.provider === 'openai' ? req.body.provider : null;
+    let provider = pedido || cfg.ia_provider || 'openai';
+    if (provider === 'gemini' && !cfg.gemini_key && cfg.openai_key && !pedido) provider = 'openai';
+    if (provider === 'openai' && !cfg.openai_key && cfg.gemini_key && !pedido) provider = 'gemini';
+    const maxTokens = Math.min(2000, Math.max(50, parseInt(req.body?.max_tokens, 10) || 800));
+    let texto = '';
+    if (provider === 'gemini') {
+      if (!cfg.gemini_key) return res.status(400).json({ error: 'IA (Gemini) não configurada. Fale com o administrador.' });
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(cfg.gemini_key)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }] }),
+      });
+      if (!r.ok) return res.status(502).json({ error: `Gemini ${r.status}`, detalhe: (await r.text().catch(() => '')).slice(0, 150) });
+      const d = await r.json();
+      texto = (d.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+    } else {
+      if (!cfg.openai_key) return res.status(400).json({ error: 'IA (OpenAI) não configurada. Fale com o administrador.' });
+      const r = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.openai_key}` },
+        body: JSON.stringify({ model: 'gpt-4o-mini', max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }] }),
+      });
+      if (!r.ok) return res.status(502).json({ error: `OpenAI ${r.status}`, detalhe: (await r.text().catch(() => '')).slice(0, 150) });
+      const d = await r.json();
+      texto = (d.choices?.[0]?.message?.content || '').trim();
+    }
+    res.json({ texto, provider });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Falha na IA.' });
+  }
+});
+
 app.post('/alerta', checkAuth, async (req, res) => {
   const t = String(req.body?.texto || '').trim();
   if (!t) return res.status(400).json({ error: 'Envie "texto".' });
