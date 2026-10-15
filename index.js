@@ -452,8 +452,10 @@ setInterval(() => {
 
 // ---------- Middleware simples de autenticação por token ----------
 function checkAuth(req, res, next) {
-  if (!API_TOKEN) return next(); // sem token configurado = sem checagem (defina API_TOKEN!)
-  const token = req.headers['x-api-token'] || req.query.token;
+  // Sem API_TOKEN o servidor não atende nada (antes ficava aberto para qualquer um)
+  if (!API_TOKEN) return res.status(503).json({ error: 'Servidor sem API_TOKEN configurado.' });
+  // O token vai no cabeçalho; pela URL (fica em logs) só na página do QR aberta no navegador
+  const token = req.headers['x-api-token'] || (req.path === '/qr' ? req.query.token : undefined);
   if (token !== API_TOKEN) {
     return res.status(401).json({ error: 'Token inválido. Envie o header x-api-token.' });
   }
@@ -545,7 +547,7 @@ async function startSock() {
 
         fetch(N8N_WEBHOOK_RESPOSTA, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'x-webhook-secret': process.env.N8N_WEBHOOK_SECRET || '' },   // a automação só aceita com este segredo
           body: JSON.stringify({
             phone,
             mensagem: texto,
