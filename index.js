@@ -156,7 +156,13 @@ function lerMensagem(msg) {
   const c = conteudo[tipo] || {};
   switch (tipo) {
     case 'conversation': return { texto: conteudo.conversation || '', tipo: 'texto' };
-    case 'extendedTextMessage': return { texto: c.text || '', tipo: 'texto' };
+    case 'extendedTextMessage': {
+      // Link com prévia (imagem pequena + título + descrição), como o WhatsApp mostra
+      const link = (c.title || c.description || c.jpegThumbnail) && (c.matchedText || c.canonicalUrl)
+        ? { titulo: c.title || null, descricao: c.description || null, url: c.canonicalUrl || c.matchedText || null, thumb: c.jpegThumbnail && c.jpegThumbnail.length ? Buffer.from(c.jpegThumbnail) : null }
+        : null;
+      return { texto: c.text || '', tipo: 'texto', link };
+    }
     case 'imageMessage': return { texto: c.caption ? `📷 Foto: ${c.caption}` : '📷 Foto', tipo: 'imagem', midia: { mime: c.mimetype, tam: Number(c.fileLength) || 0 } };
     case 'videoMessage': return { texto: c.caption ? `🎥 Vídeo: ${c.caption}` : '🎥 Vídeo', tipo: 'video', midia: { mime: c.mimetype, tam: Number(c.fileLength) || 0 } };
     case 'audioMessage': return { texto: '🎤 Áudio', tipo: 'audio', midia: { mime: c.mimetype, tam: Number(c.fileLength) || 0 } };
@@ -230,6 +236,41 @@ async function guardarMidia(msg, lida, buffer, onde) {
       nome_arquivo: lida.midia.nome || null, criado_em: new Date(((Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000)) * 1000)).toISOString(),
     }, 'resolution=ignore-duplicates,return=minimal');
   } catch (e) { console.warn('[mídia] não guardou:', e.message); }
+}
+
+// Cartão do link: guarda a imagem pequena da prévia (se veio) e título/descrição/url
+async function guardarLink(msg, lida, onde) {
+  const l = lida && lida.link;
+  if (!l || !SUPABASE_KEY || !PROSPECTA_USER_ID) return;
+  let path = null;
+  try {
+    if (l.thumb && l.thumb.length < 512 * 1024) {
+      path = `${PROSPECTA_USER_ID}/${msg.key.id}.jpg`;
+      const r = await fetch(`${SUPABASE_URL}/storage/v1/object/midias/${path}`, {
+        method: 'POST', headers: { 'Authorization': `Bearer ${SUPABASE_KEY}`, 'apikey': SUPABASE_KEY, 'Content-Type': 'image/jpeg', 'x-upsert': 'true' }, body: l.thumb,
+      });
+      if (!r.ok) path = null;
+    }
+    await supa('POST', 'midias', {
+      msg_id: msg.key.id, user_id: PROSPECTA_USER_ID, phone: onde.phone || null, grupo_id: onde.grupoId || null, tipo: 'link', mime: path ? 'image/jpeg' : null, path,
+      titulo: (l.titulo || '').slice(0, 300) || null, descricao: (l.descricao || '').slice(0, 600) || null, url: (l.url || '').slice(0, 1000) || null,
+      criado_em: new Date(((Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000)) * 1000)).toISOString(),
+    }, 'resolution=ignore-duplicates,return=minimal');
+  } catch (e) { console.warn('[link] não guardou:', e.message); }
+}
+
+// ---------- Fotos de perfil (contatos e grupos), com cache de 12h ----------
+const _fotos = new Map();                       // jid -> { url, em }
+const FOTO_TTL = 12 * 60 * 60 * 1000;
+async function fotoDePerfil(jid) {
+  const c = _fotos.get(jid);
+  if (c && Date.now() - c.em < FOTO_TTL) return c.url;
+  let url = null;
+  try { url = await Promise.race([sock.profilePictureUrl(jid, 'preview'), new Promise(r => setTimeout(() => r(undefined), 5000))]); } catch (e) { url = null; }
+  if (url === undefined) return null;          // demorou: não guarda no cache, tenta de novo depois
+  if (_fotos.size > 20000) _fotos.delete(_fotos.keys().next().value);
+  _fotos.set(jid, { url: url || null, em: Date.now() });
+  return url || null;
 }
 
 // ---------- Áudio gravado no navegador vira mensagem de voz do WhatsApp (ogg/opus) ----------
@@ -391,6 +432,7 @@ async function registrarMensagemGrupo(msg) {
   registrarOportunidadeGrupo(msg, lida, grupoId, autorPhone);              // vale para qualquer grupo
   if (!(await gruposAcompanhados()).has(grupoId)) return;                 // guardar a conversa: só os acompanhados
   if (lida.midia) baixarMidia(msg, lida).then(b => guardarMidia(msg, lida, b, { grupoId })).catch(() => {});
+  if (lida.link) guardarLink(msg, lida, { grupoId });
   try {
     await supa('POST', 'grupo_mensagens', {
       msg_id: msg.key.id, user_id: PROSPECTA_USER_ID, grupo_id: grupoId, grupo_nome: await nomeDoGrupo(grupoId),
@@ -488,6 +530,7 @@ async function startSock() {
         let texto = lida.texto;
         const bufferMidia = lida.midia ? await baixarMidia(msg, lida) : null;
         if (bufferMidia) guardarMidia(msg, lida, bufferMidia, { phone });
+        if (lida.link) guardarLink(msg, lida, { phone });
         if (lida.tipo === 'audio') {
           const transcrito = await transcreverAudio(msg, bufferMidia);
           if (transcrito) texto = `🎤 Áudio: "${transcrito}"`;
@@ -860,6 +903,29 @@ app.get('/groups/:id/participants', checkAuth, async (req, res) => {
   } catch (err) {
     console.error('[groups/participants] erro:', err && err.message);
     res.status(500).json({ error: err.message || 'Erro ao ler o grupo.' });
+  }
+});
+
+// Fotos de perfil: { ids: ["5511999998888", "1203...@g.us"] } -> { fotos: { id: url|null } } (até 60 por vez)
+app.post('/fotos', checkAuth, async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? [...new Set(req.body.ids.map(String))].slice(0, 60) : [];
+    if (!ids.length) return res.json({ fotos: {} });
+    if (!(await aguardarConexao(5000))) return res.status(503).json({ error: 'WhatsApp não conectado.', codigo: 'desconectado' });
+    const fotos = {};
+    const fila = ids.slice();
+    const trabalhar = async () => {
+      while (fila.length) {
+        const id = fila.shift();
+        let jid = id;
+        if (!id.endsWith('@g.us')) { const d = id.replace(/\D/g, ''); if (d.length < 10 || d.length > 13) { fotos[id] = null; continue; } jid = d + '@s.whatsapp.net'; }
+        fotos[id] = await fotoDePerfil(jid);
+      }
+    };
+    await Promise.all([trabalhar(), trabalhar(), trabalhar(), trabalhar()]);   // 4 de cada vez
+    res.json({ fotos });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Erro ao buscar fotos.' });
   }
 });
 
