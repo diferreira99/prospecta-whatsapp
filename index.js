@@ -471,14 +471,35 @@ async function loginDoDono(jwt) {
     return true;
   } catch (e) { return false; }
 }
+// Quem erra a senha/token muitas vezes fica bloqueado um tempo (contra tentativa e erro).
+const FALHAS_MAX = 60, FALHAS_JANELA_MS = 10 * 60 * 1000, BLOQUEIO_MS = 15 * 60 * 1000;
+const _falhasAuth = new Map();   // ip -> { n, desde, ate }
+function ipDe(req) { return String(req.headers['x-real-ip'] || String(req.headers['x-forwarded-for'] || '').split(',')[0] || req.socket.remoteAddress || '?').trim(); }
+function tokenConfere(t) {
+  const a = Buffer.from(String(t || '')), b = Buffer.from(API_TOKEN);
+  return a.length === b.length && require('crypto').timingSafeEqual(a, b);
+}
+function registrarFalha(ip) {
+  const agora = Date.now();
+  let f = _falhasAuth.get(ip);
+  if (!f || agora - f.desde > FALHAS_JANELA_MS) f = { n: 0, desde: agora, ate: 0 };
+  f.n++;
+  if (f.n >= FALHAS_MAX) { f.ate = agora + BLOQUEIO_MS; console.warn(`[segurança] ${ip} bloqueado por 15 min após ${f.n} tentativas sem acesso`); }
+  _falhasAuth.set(ip, f);
+  if (_falhasAuth.size > 5000) for (const [k, v] of _falhasAuth) if (v.ate < agora && agora - v.desde > FALHAS_JANELA_MS) _falhasAuth.delete(k);
+}
 async function checkAuth(req, res, next) {
   // Sem API_TOKEN o servidor não atende nada (antes ficava aberto para qualquer um)
   if (!API_TOKEN) return res.status(503).json({ error: 'Servidor sem API_TOKEN configurado.' });
+  const ip = ipDe(req);
+  const f = _falhasAuth.get(ip);
+  if (f && f.ate > Date.now()) return res.status(429).json({ error: 'Muitas tentativas sem acesso. Tente de novo em alguns minutos.' });
   // O token vai no cabeçalho; pela URL (fica em logs) só na página do QR aberta no navegador
   const token = req.headers['x-api-token'] || (req.path === '/qr' ? req.query.token : undefined);
-  if (token && token === API_TOKEN) return next();
+  if (token && tokenConfere(token)) return next();
   const jwt = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
   if (jwt && await loginDoDono(jwt)) return next();
+  registrarFalha(ip);
   return res.status(401).json({ error: jwt ? 'Login sem acesso a este servidor. Entre de novo no Prospecta+.' : 'Token inválido. Envie o header x-api-token.' });
 }
 
