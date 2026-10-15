@@ -361,6 +361,13 @@ async function registrarOportunidadeGrupo(msg, lida, grupoId, autorPhone) {
     console.log('[grupo] pedido de indicação detectado');
   } catch (e) { console.warn('[grupo] oportunidade não gravada:', e.message); }
 }
+// Diagnóstico: a cada 10 min, se chegou algo de grupo, um resumo no log (sem conteúdo das mensagens)
+const _diagGrupos = { chegaram: 0, semConteudo: 0, gravadas: 0 };
+setInterval(() => {
+  if (!_diagGrupos.chegaram) return;
+  console.log(`[grupo] últimos 10 min: ${_diagGrupos.chegaram} mensagens de grupo, ${_diagGrupos.gravadas} gravadas (grupos acompanhados), ${_diagGrupos.semConteudo} não abriram`);
+  _diagGrupos.chegaram = _diagGrupos.semConteudo = _diagGrupos.gravadas = 0;
+}, 10 * 60 * 1000).unref();
 async function registrarMensagemGrupo(msg) {
   if (!SUPABASE_KEY || !PROSPECTA_USER_ID) return;
   const grupoId = msg.key.remoteJid;
@@ -378,6 +385,7 @@ async function registrarMensagemGrupo(msg) {
       mensagem: lida.texto, tipo: lida.tipo, de_mim: !!msg.key.fromMe,
       criado_em: new Date(((Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000)) * 1000)).toISOString(),
     }, 'resolution=ignore-duplicates,return=minimal');
+    _diagGrupos.gravadas++;
   } catch (e) { console.warn('[grupo] não gravou a mensagem:', e.message); }
 }
 // Limpeza: mensagens de grupo com mais de 30 dias saem do banco (uma vez por dia)
@@ -424,6 +432,7 @@ async function startSock() {
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     for (const msg of messages) {
       try {
+        if (msg.key?.remoteJid?.endsWith('@g.us')) { _diagGrupos.chegaram++; if (!msg.message) _diagGrupos.semConteudo++; }
         if (!msg.message) continue;
         if (msg.key.remoteJid === 'status@broadcast') continue;   // status (stories) não interessa
         // Grupos: nunca viram lead nem vão para a IA; só ficam gravados se você acompanha o grupo no Inbox
