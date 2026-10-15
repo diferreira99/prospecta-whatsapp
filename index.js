@@ -64,6 +64,8 @@ const {
 
 const app = express();
 app.use(cors());
+// Confere o acesso ANTES de ler o corpo: sem token/login, nem os 50 MB de upload são aceitos.
+app.use((req, res, next) => (req.path === '/' || req.method === 'OPTIONS') ? next() : checkAuth(req, res, next));
 app.use(express.json({ limit: '50mb' })); // PDFs/mídias em base64 passam fácil do limite padrão (100kb)
 
 const PORT = process.env.PORT || 3000;
