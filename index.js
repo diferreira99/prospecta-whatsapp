@@ -338,6 +338,19 @@ async function gruposAcompanhados() {
   return _gruposAcompanhados.ids;
 }
 const _nomesGrupos = new Map();
+// Nome que cada pessoa usa no WhatsApp (pushName), aprendido das mensagens e da agenda: aparece na lista de integrantes
+const _nomesContatos = new Map();
+function lembrarNome(phone, nome) {
+  if (!phone || !nome || typeof nome !== 'string') return;
+  if (_nomesContatos.size > 20000) _nomesContatos.delete(_nomesContatos.keys().next().value);
+  _nomesContatos.set(String(phone), nome.slice(0, 80));
+}
+function telefoneDoJid(jid) {
+  jid = String(jid || '');
+  if (!jid.endsWith('@s.whatsapp.net')) return null;
+  const d = jid.split('@')[0].split(':')[0].replace(/\D/g, '');
+  return d.length >= 10 && d.length <= 13 ? d : null;
+}
 async function nomeDoGrupo(id) {
   if (_nomesGrupos.has(id)) return _nomesGrupos.get(id);
   try { const m = await sock.groupMetadata(id); _nomesGrupos.set(id, m.subject || ''); return m.subject || ''; } catch (e) { return ''; }
@@ -424,6 +437,9 @@ async function startSock() {
   });
 
   sock.ev.on('creds.update', saveCreds);
+  const _aprenderContatos = lista => { for (const c of lista || []) lembrarNome(telefoneDoJid(c.phoneNumber || c.jid || c.id), c.name || c.notify || c.verifiedName); };
+  sock.ev.on('contacts.upsert', _aprenderContatos);
+  sock.ev.on('contacts.update', _aprenderContatos);
 
   // ---------- Mensagens novas (só escuta e registra, NUNCA responde nada automaticamente) ----------
   // Encaminha pro n8n: telefone + texto + horário. O n8n decide se parece auto-resposta
@@ -433,6 +449,7 @@ async function startSock() {
     for (const msg of messages) {
       try {
         if (msg.key?.remoteJid?.endsWith('@g.us')) { _diagGrupos.chegaram++; if (!msg.message) _diagGrupos.semConteudo++; }
+        if (!msg.key?.fromMe && msg.pushName) lembrarNome(telefoneDoJid(msg.key.participantPn || msg.key.participantAlt || msg.key.participant || msg.key.remoteJid), msg.pushName);
         if (!msg.message) continue;
         if (msg.key.remoteJid === 'status@broadcast') continue;   // status (stories) não interessa
         // Grupos: nunca viram lead nem vão para a IA; só ficam gravados se você acompanha o grupo no Inbox
@@ -815,18 +832,31 @@ app.get('/groups/:id/participants', checkAuth, async (req, res) => {
     const id = String(req.params.id || '');
     if (!id.endsWith('@g.us')) return res.status(400).json({ error: 'Grupo inválido.' });
     const m = await sock.groupMetadata(id);
+    _nomesGrupos.set(id, m.subject || '');
     const meu = String(sock?.user?.id || '').split(':')[0].split('@')[0];
     const vistos = new Set();
     const participantes = [];
-    let escondidos = 0;
+    let escondidos = 0, admins = 0, souAdmin = false;
     for (const p of m.participants || []) {
+      if (p.admin) admins++;
       const t = telefoneDoParticipante(p);
+      if (t && t === meu) { souAdmin = !!p.admin; continue; }
       if (!t) { escondidos++; continue; }
-      if (t === meu || vistos.has(t)) continue;
+      if (vistos.has(t)) continue;
       vistos.add(t);
-      participantes.push({ phone: t, admin: !!p.admin });
+      participantes.push({ phone: t, admin: !!p.admin, dono: p.admin === 'superadmin', nome: _nomesContatos.get(t) || null });
     }
-    res.json({ id, nome: m.subject || '', participantes, escondidos });
+    // Foto do grupo: opcional (grupo sem foto ou privacidade devolvem erro)
+    let fotoUrl = null;
+    if (req.query.foto !== '0') {
+      try { fotoUrl = await Promise.race([sock.profilePictureUrl(id, 'image'), new Promise(r => setTimeout(() => r(null), 4000))]); } catch (e) { fotoUrl = null; }
+    }
+    res.json({
+      id, nome: m.subject || '', participantes, escondidos,
+      descricao: m.desc || '', criadoEm: m.creation ? Number(m.creation) * 1000 : null,
+      dono: telefoneDoJid(m.ownerPn || m.owner || ''), total: m.size || (m.participants || []).length,
+      admins, souAdmin, soAdminsFalam: !!m.announce, soAdminsEditam: !!m.restrict, fotoUrl,
+    });
   } catch (err) {
     console.error('[groups/participants] erro:', err && err.message);
     res.status(500).json({ error: err.message || 'Erro ao ler o grupo.' });
