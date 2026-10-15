@@ -1311,6 +1311,115 @@ app.post('/send-group', checkAuth, async (req, res) => {
   }
 });
 
+// ---------- Backup diário do banco (só no servidor com BACKUP_ATIVO=1) ----------
+// Toda madrugada copia todas as tabelas + a lista de logins para o volume do Railway
+// (fora do Supabase) e guarda os últimos 30 dias. O painel admin lista e baixa as cópias.
+// Senhas dos logins não entram (o Supabase não entrega); fotos/áudios do Storage também não (só a lista).
+const BACKUP_ATIVO = process.env.BACKUP_ATIVO === '1';
+const BACKUP_DIR = process.env.BACKUP_DIR || path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || path.dirname(AUTH_FOLDER), 'backups');
+const BACKUP_DIAS = parseInt(process.env.BACKUP_DIAS, 10) || 30;
+const BACKUP_HORA = parseInt(process.env.BACKUP_HORA, 10) || 3;    // hora de Brasília
+const zlib = require('zlib');
+let _backupRodando = false, _backupUltimoErro = null;
+function diaSP(d) { return new Date(d || Date.now()).toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' }); }   // 2026-10-16
+async function tabelasDoBanco() {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/`, { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, Accept: 'application/openapi+json' } });
+  if (!r.ok) throw new Error('lista de tabelas ' + r.status);
+  const api = await r.json();
+  return Object.keys(api.definitions || {}).filter((t) => !/^v_/.test(t)).sort();   // v_… são visões (montadas a partir das tabelas)
+}
+async function lerTabelaToda(t) {
+  const linhas = [];
+  for (let de = 0; de < 2000000; de += 1000) {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/${encodeURIComponent(t)}?select=*`, { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Range-Unit': 'items', Range: `${de}-${de + 999}` } });
+    if (!r.ok && r.status !== 206) throw new Error(`${t}: ${r.status}`);
+    const lote = await r.json();
+    linhas.push(...lote);
+    if (lote.length < 1000) break;
+  }
+  return linhas;
+}
+async function fazerBackup(motivo) {
+  if (_backupRodando) throw new Error('Já tem um backup rodando.');
+  if (!SUPABASE_KEY) throw new Error('Servidor sem acesso ao banco.');
+  _backupRodando = true;
+  const inicio = Date.now();
+  try {
+    const tabelas = {}, contagem = {}, falhas = [];
+    for (const t of await tabelasDoBanco()) {
+      try { tabelas[t] = await lerTabelaToda(t); contagem[t] = tabelas[t].length; }
+      catch (e) { falhas.push(t + ' (' + e.message + ')'); }
+    }
+    const usuarios = [];
+    for (let pg = 1; pg <= 50; pg++) {
+      const r = await fetch(`${SUPABASE_URL}/auth/v1/admin/users?page=${pg}&per_page=200`, { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } });
+      if (!r.ok) { falhas.push('logins (' + r.status + ')'); break; }
+      const lote = ((await r.json()) || {}).users || [];
+      usuarios.push(...lote.map((u) => ({ id: u.id, email: u.email, criado: u.created_at, ultimo_acesso: u.last_sign_in_at, metadados: u.user_metadata, bloqueado_ate: u.banned_until || null })));
+      if (lote.length < 200) break;
+    }
+    let arquivos = [];
+    try {
+      const r = await fetch(`${SUPABASE_URL}/storage/v1/object/list/midias`, { method: 'POST', headers: supaHeaders(), body: JSON.stringify({ prefix: '', limit: 10000 }) });
+      if (r.ok) arquivos = (await r.json()).map((x) => x.name);
+    } catch (e) {}
+    const dados = { versao: 1, projeto: SUPABASE_URL, criadoEm: new Date().toISOString(), motivo: motivo || 'diario', contagem, falhas, usuarios, pastasStorage: arquivos, tabelas };
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    const nome = `backup-${diaSP()}.json.gz`;
+    const tmp = path.join(BACKUP_DIR, nome + '.tmp');
+    fs.writeFileSync(tmp, zlib.gzipSync(Buffer.from(JSON.stringify(dados))));
+    fs.renameSync(tmp, path.join(BACKUP_DIR, nome));   // só aparece quando está completo
+    // guarda só os últimos BACKUP_DIAS dias
+    const todos = fs.readdirSync(BACKUP_DIR).filter((f) => /^backup-\d{4}-\d{2}-\d{2}\.json\.gz$/.test(f)).sort();
+    for (const velho of todos.slice(0, Math.max(0, todos.length - BACKUP_DIAS))) { try { fs.unlinkSync(path.join(BACKUP_DIR, velho)); } catch (e) {} }
+    _backupUltimoErro = falhas.length ? falhas.join(', ') : null;
+    console.log(`[backup] ${nome}: ${Object.keys(contagem).length} tabelas, ${usuarios.length} logins, ${Math.round((Date.now() - inicio) / 1000)}s` + (falhas.length ? ' · falhas: ' + falhas.join(', ') : ''));
+    return { nome, tabelas: Object.keys(contagem).length, linhas: Object.values(contagem).reduce((a, b) => a + b, 0), logins: usuarios.length, falhas };
+  } catch (e) {
+    _backupUltimoErro = e.message;
+    throw e;
+  } finally { _backupRodando = false; }
+}
+function listarBackups() {
+  try {
+    return fs.readdirSync(BACKUP_DIR).filter((f) => /^backup-\d{4}-\d{2}-\d{2}\.json\.gz$/.test(f)).sort().reverse()
+      .map((f) => { const st = fs.statSync(path.join(BACKUP_DIR, f)); return { nome: f, dia: f.slice(7, 17), bytes: st.size, criadoEm: st.mtime.toISOString() }; });
+  } catch (e) { return []; }
+}
+// Confere a cada 10 min: passou da hora e ainda não tem o de hoje → faz. Falhou → avisa no número de alerta (1x por dia).
+let _backupAvisoFalha = '';
+async function verificarBackup() {
+  if (!BACKUP_ATIVO || _backupRodando) return;
+  const hora = parseInt(new Date().toLocaleTimeString('en-GB', { timeZone: 'America/Sao_Paulo', hour: '2-digit', hour12: false }), 10);
+  if (hora < BACKUP_HORA) return;
+  if (listarBackups().some((b) => b.dia === diaSP())) return;
+  try { await fazerBackup('diario'); }
+  catch (e) {
+    console.warn('[backup] falhou:', e.message);
+    if (_backupAvisoFalha !== diaSP()) { _backupAvisoFalha = diaSP(); enviarAlerta(`⚠️ *Backup do banco falhou* hoje (${e.message}). Vou tentar de novo em 10 minutos.`); }
+  }
+}
+if (BACKUP_ATIVO) { setTimeout(verificarBackup, 60 * 1000).unref(); setInterval(verificarBackup, 10 * 60 * 1000).unref(); }
+
+function exigirBackup(req, res, next) { if (!BACKUP_ATIVO) return res.status(404).json({ error: 'Backup não está ligado neste servidor.' }); next(); }
+app.get('/backups', checkAuth, exigirBackup, (req, res) => {
+  res.json({ backups: listarBackups(), rodando: _backupRodando, ultimoErro: _backupUltimoErro, guardaDias: BACKUP_DIAS, hora: BACKUP_HORA });
+});
+app.post('/backups/agora', checkAuth, exigirBackup, async (req, res) => {
+  try { res.json({ ok: true, ...(await fazerBackup('manual')) }); }
+  catch (e) { res.status(e.message.startsWith('Já tem') ? 409 : 500).json({ error: e.message }); }
+});
+app.get('/backups/:nome', checkAuth, exigirBackup, (req, res) => {
+  const nome = String(req.params.nome || '');
+  if (!/^backup-\d{4}-\d{2}-\d{2}\.json\.gz$/.test(nome)) return res.status(400).json({ error: 'Nome inválido.' });
+  const arq = path.join(BACKUP_DIR, nome);
+  if (!fs.existsSync(arq)) return res.status(404).json({ error: 'Backup não encontrado.' });
+  res.setHeader('Content-Type', 'application/gzip');
+  res.setHeader('Content-Disposition', `attachment; filename="${nome}"`);
+  res.setHeader('Cache-Control', 'no-store');
+  fs.createReadStream(arq).pipe(res);
+});
+
 app.get('/', (req, res) => {
   res.send('Servidor WhatsApp (Baileys) rodando. Acesse /qr para conectar.');
 });
