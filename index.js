@@ -604,6 +604,7 @@ async function startSock() {
       } else {
         publicarEstado(false, true, 'O WhatsApp desconectou este aparelho. Leia o QR code de novo.');
         console.log('[Baileys] Sessão deslogada: apagando a sessão antiga e gerando QR novo.');
+        if (Date.now() - _saidaPedidaEm > 60000) protegerAposQueda().catch(e => console.warn('[proteção]', e.message));
         limparSessao();
         setTimeout(() => startSock().catch(e => console.error('[Baileys] Erro ao reiniciar:', e && e.message)), 2000);
       }
@@ -758,6 +759,87 @@ const ALERTAS_INTERVALO_MS = parseInt(process.env.ALERTAS_INTERVALO_MS, 10) || 2
 setInterval(() => { verificarCampanhas().catch(() => {}); resumoDoDia().catch(() => {}); }, ALERTAS_INTERVALO_MS).unref();
 setTimeout(() => verificarCampanhas().catch(() => {}), Math.min(20000, ALERTAS_INTERVALO_MS)).unref();
 
+// ---------- Proteção da conta (configurada em Integrações → 🛡️ Proteção da conta) ----------
+const PROTECAO_PADRAO = { autoCancelar: true, umBalao: true, rampa: { ativo: false, auto: true, inicio: 10, passo: 5, desde: null }, freio: { ativo: true, naoEntregues: 4, janela: 10 } };
+let _protecao = { v: null, em: 0 };
+async function protecaoCfg(forcar) {
+  if (!forcar && _protecao.v && Date.now() - _protecao.em < 2 * 60 * 1000) return _protecao.v;
+  let p = null;
+  try { const r = await supa('GET', `user_config?user_id=eq.${encodeURIComponent(PROSPECTA_USER_ID)}&select=protecao&limit=1`); p = r && r[0] && r[0].protecao; } catch (e) {}
+  const v = Object.assign({}, PROTECAO_PADRAO, p || {});
+  v.rampa = Object.assign({}, PROTECAO_PADRAO.rampa, (p && p.rampa) || {});
+  v.freio = Object.assign({}, PROTECAO_PADRAO.freio, (p && p.freio) || {});
+  _protecao = { v, em: Date.now() };
+  return v;
+}
+async function salvarProtecao(mudar) {
+  const v = JSON.parse(JSON.stringify(await protecaoCfg(true)));
+  mudar(v);
+  try { await supa('PATCH', `user_config?user_id=eq.${encodeURIComponent(PROSPECTA_USER_ID)}`, { protecao: v }, 'return=minimal'); _protecao = { v, em: Date.now() }; }
+  catch (e) { console.warn('[proteção] não salvou:', e.message); }
+}
+const fim8 = t => String(t || '').replace(/\D/g, '').slice(-8);
+// Campanhas em andamento (últimas 8h, sem cancelamento e sem terminar)
+async function campanhasAtivas() {
+  const email = await emailDono(); if (!email) return [];
+  const desde = new Date(Date.now() - 8 * 3600 * 1000).toISOString();
+  const linhas = await supa('GET', `status_campanha?user_email=eq.${encodeURIComponent(email)}&created_at=gte.${encodeURIComponent(desde)}&select=campanhaId,idx,total,status,phone,log,created_at&order=id.asc&limit=5000`);
+  const c = {};
+  (linhas || []).forEach(l => {
+    const x = c[l.campanhaId] = c[l.campanhaId] || { id: l.campanhaId, total: 0, idx: new Set(), cancel: false, nome: '', ini: l.created_at, enviados: [] };
+    x.total = Math.max(x.total, parseInt(l.total, 10) || 0);
+    if (l.status === 'cancelado') x.cancel = true; else if (l.idx !== null && l.idx !== undefined) x.idx.add(String(l.idx));
+    if (l.status === 'enviado' && l.phone) x.enviados.push({ phone: l.phone, em: l.created_at });
+    const m = String(l.log || '').match(/\|\s*([^|]+)$/); if (m && !x.nome) x.nome = m[1].trim();
+  });
+  return Object.values(c).filter(x => !x.cancel && (!x.total || x.idx.size < x.total)).map(x => Object.assign(x, { email }));
+}
+async function cancelarCampanha(c, motivo) {
+  await supa('POST', 'status_campanha', {
+    campanhaId: c.id, status: 'cancelado', lead: 'CANCELAMENTO', user_email: c.email,
+    log: `[CANCELADO] Campanha ${c.id} cancelada automaticamente: ${motivo}`,
+    data: new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }),
+  }, 'return=minimal');
+  const est = lerAlertasEstado(); est.campanhas[c.id] = 'cancelado'; salvarAlertasEstado();   // o aviso genérico de "cancelada" não repete
+  console.log('[proteção] campanha cancelada automaticamente:', motivo);
+}
+// O WhatsApp derrubou o aparelho (restrição ou outro login): cancela o que estava rodando e liga o modo pós-restrição
+async function protegerAposQueda() {
+  if (!SUPABASE_KEY || !PROSPECTA_USER_ID) return;
+  const p = await protecaoCfg(true);
+  const partes = [];
+  if (p.autoCancelar) {
+    try {
+      for (const c of await campanhasAtivas()) { await cancelarCampanha(c, 'o WhatsApp derrubou o aparelho'); partes.push(`⏹ Cancelei a campanha ${c.nome ? '"' + c.nome + '"' : ''} (${c.idx.size} de ${c.total} feitas) para ela não continuar quando você reconectar.`); }
+    } catch (e) { console.warn('[proteção] não cancelou:', e.message); }
+  }
+  if (p.rampa.auto) {
+    await salvarProtecao(v => { v.rampa.ativo = true; v.rampa.desde = new Date().toISOString(); });
+    partes.push(`🐢 Modo pós-restrição ligado: as próximas campanhas começam com ${p.rampa.inicio} por dia e sobem ${p.rampa.passo} por dia até o seu limite.`);
+  }
+  if (partes.length) enviarAlerta(`⚠️ *O WhatsApp desconectou o servidor* (${horaSP(new Date().toISOString())}). Pode ser uma restrição da conta.\n` + partes.join('\n') + `\nDá para mudar isso em Integrações → 🛡️ Proteção da conta.`);
+}
+// Freio: muitas das últimas mensagens não chegaram (sinal de bloqueio/denúncia) → cancela a campanha
+async function freioDeBloqueio() {
+  if (!SUPABASE_KEY || !PROSPECTA_USER_ID || !isConnected) return;
+  const p = await protecaoCfg();
+  if (!p.freio.ativo) return;
+  const limiteMs = Date.now() - 15 * 60 * 1000;
+  for (const c of await campanhasAtivas().catch(() => [])) {
+    const velhos = c.enviados.filter(e => new Date(e.em).getTime() < limiteMs).slice(-Math.max(3, p.freio.janela || 10));
+    if (velhos.length < Math.max(3, p.freio.janela || 10)) continue;
+    let ent = [];
+    try { ent = await supa('GET', `entregas?user_id=eq.${encodeURIComponent(PROSPECTA_USER_ID)}&enviado_em=gte.${encodeURIComponent(c.ini)}&select=phone,status`) || []; } catch (e) { continue; }
+    const chegou = new Set(ent.filter(x => Number(x.status) >= 3).map(x => fim8(x.phone)));
+    const nao = velhos.filter(v => !chegou.has(fim8(v.phone))).length;
+    if (nao >= (p.freio.naoEntregues || 4)) {
+      await cancelarCampanha(c, `${nao} das últimas ${velhos.length} mensagens não chegaram`);
+      await enviarAlerta(`🛑 *Freio de proteção acionado*${c.nome ? ' em "' + c.nome + '"' : ''}\n${nao} das últimas ${velhos.length} empresas não receberam a mensagem depois de 15 min (sinal de bloqueio ou de denúncia). Cancelei a campanha para proteger o número.\nVale esperar umas horas antes de mandar de novo.`);
+    }
+  }
+}
+setInterval(() => { freioDeBloqueio().catch(() => {}); }, ALERTAS_INTERVALO_MS).unref();
+
 // Apaga a sessão salva (para conectar outro número ou depois de o WhatsApp deslogar este aparelho)
 function limparSessao() {
   try {
@@ -868,8 +950,10 @@ app.get('/status', checkAuth, (req, res) => {
 });
 
 // Desconecta o WhatsApp deste servidor (para trocar de número). Em seguida aparece um QR novo.
+let _saidaPedidaEm = 0;   // desconectar pelo app não é "queda": não cancela campanha nem liga a rampa
 app.post('/logout', checkAuth, async (req, res) => {
   try {
+    _saidaPedidaEm = Date.now();
     const era = numeroConectado();
     if (sock && isConnected) {
       try { await sock.logout(); } catch (e) { console.warn('[logout]', e.message); }
