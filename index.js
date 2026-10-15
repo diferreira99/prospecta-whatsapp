@@ -157,11 +157,11 @@ function lerMensagem(msg) {
   switch (tipo) {
     case 'conversation': return { texto: conteudo.conversation || '', tipo: 'texto' };
     case 'extendedTextMessage': return { texto: c.text || '', tipo: 'texto' };
-    case 'imageMessage': return { texto: c.caption ? `📷 Foto: ${c.caption}` : '📷 Foto', tipo: 'imagem' };
-    case 'videoMessage': return { texto: c.caption ? `🎥 Vídeo: ${c.caption}` : '🎥 Vídeo', tipo: 'video' };
-    case 'audioMessage': return { texto: '🎤 Áudio', tipo: 'audio' };
+    case 'imageMessage': return { texto: c.caption ? `📷 Foto: ${c.caption}` : '📷 Foto', tipo: 'imagem', midia: { mime: c.mimetype, tam: Number(c.fileLength) || 0 } };
+    case 'videoMessage': return { texto: c.caption ? `🎥 Vídeo: ${c.caption}` : '🎥 Vídeo', tipo: 'video', midia: { mime: c.mimetype, tam: Number(c.fileLength) || 0 } };
+    case 'audioMessage': return { texto: '🎤 Áudio', tipo: 'audio', midia: { mime: c.mimetype, tam: Number(c.fileLength) || 0 } };
     case 'stickerMessage': return { texto: '🌟 Figurinha', tipo: 'figurinha' };
-    case 'documentMessage': return { texto: `📄 Documento: ${c.fileName || c.title || 'arquivo'}${c.caption ? ' — ' + c.caption : ''}`, tipo: 'documento' };
+    case 'documentMessage': return { texto: `📄 Documento: ${c.fileName || c.title || 'arquivo'}${c.caption ? ' — ' + c.caption : ''}`, tipo: 'documento', midia: { mime: c.mimetype, tam: Number(c.fileLength) || 0, nome: c.fileName || c.title || 'arquivo' } };
     case 'contactMessage': return { texto: `👤 Contato: ${c.displayName || ''}`.trim(), tipo: 'contato' };
     case 'contactsArrayMessage': return { texto: `👤 Contatos: ${(c.contacts || []).map(x => x.displayName).filter(Boolean).join(', ')}`, tipo: 'contato' };
     case 'locationMessage': case 'liveLocationMessage': return { texto: `📍 Localização${c.name ? ': ' + c.name : ''}${c.address ? ' — ' + c.address : ''}`, tipo: 'localizacao' };
@@ -183,11 +183,11 @@ async function chaveOpenAI() {
   } catch (e) { _chaveOpenAI = { valor: '', em: Date.now() }; }
   return _chaveOpenAI.valor;
 }
-async function transcreverAudio(msg) {
+async function transcreverAudio(msg, bufferPronto) {
   try {
     const chave = await chaveOpenAI();
     if (!chave) return '';
-    const buffer = await downloadMediaMessage(msg, 'buffer', {});
+    const buffer = bufferPronto || await downloadMediaMessage(msg, 'buffer', {});
     if (!buffer || buffer.length > 20 * 1024 * 1024) return '';
     const form = new FormData();
     form.append('file', new Blob([buffer], { type: 'audio/ogg' }), 'audio.ogg');
@@ -203,6 +203,53 @@ async function transcreverAudio(msg) {
     console.warn('[áudio] não deu para transcrever:', e.message);
     return '';
   }
+}
+
+// ---------- Mídias recebidas: o arquivo vai para o Storage (bucket privado "midias") para o Inbox mostrar ----------
+const LIMITE_MIDIA = 16 * 1024 * 1024;
+async function baixarMidia(msg, lida) {
+  if (!lida || !lida.midia || (lida.midia.tam && lida.midia.tam > LIMITE_MIDIA)) return null;
+  try {
+    const b = await downloadMediaMessage(msg, 'buffer', {});
+    return b && b.length <= LIMITE_MIDIA ? b : null;
+  } catch (e) { console.warn('[mídia] não baixou:', e.message); return null; }
+}
+const EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'video/mp4': 'mp4', 'application/pdf': 'pdf', 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a' };
+async function guardarMidia(msg, lida, buffer, onde) {
+  if (!buffer || !SUPABASE_KEY || !PROSPECTA_USER_ID) return;
+  const mime = String(lida.midia.mime || 'application/octet-stream').split(';')[0];
+  const ext = EXT[mime] || (mime.includes('ogg') ? 'ogg' : (lida.midia.nome || '').split('.').pop().slice(0, 5) || 'bin');
+  const path = `${PROSPECTA_USER_ID}/${msg.key.id}.${ext}`;
+  try {
+    const r = await fetch(`${SUPABASE_URL}/storage/v1/object/midias/${path}`, {
+      method: 'POST', headers: { 'Authorization': `Bearer ${SUPABASE_KEY}`, 'apikey': SUPABASE_KEY, 'Content-Type': mime, 'x-upsert': 'true' }, body: buffer,
+    });
+    if (!r.ok) throw new Error('storage ' + r.status);
+    await supa('POST', 'midias', {
+      msg_id: msg.key.id, user_id: PROSPECTA_USER_ID, phone: onde.phone || null, grupo_id: onde.grupoId || null, tipo: lida.tipo, mime, path,
+      nome_arquivo: lida.midia.nome || null, criado_em: new Date(((Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000)) * 1000)).toISOString(),
+    }, 'resolution=ignore-duplicates,return=minimal');
+  } catch (e) { console.warn('[mídia] não guardou:', e.message); }
+}
+
+// ---------- Áudio gravado no navegador vira mensagem de voz do WhatsApp (ogg/opus) ----------
+// O navegador grava em webm/mp4; o WhatsApp do iPhone muitas vezes não toca e o áudio chega como arquivo.
+let ffmpegPath = null;
+try { ffmpegPath = require('ffmpeg-static'); } catch (e) { console.warn('[áudio] ffmpeg-static indisponível: áudio vai sem conversão'); }
+function paraOggOpus(buffer) {
+  return new Promise((resolve, reject) => {
+    if (!ffmpegPath) return reject(new Error('sem ffmpeg'));
+    const { spawn } = require('child_process');
+    const p = spawn(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0', '-vn', '-ac', '1', '-ar', '48000', '-c:a', 'libopus', '-b:a', '32k', '-f', 'ogg', 'pipe:1']);
+    const saida = [], erros = [];
+    const tempo = setTimeout(() => { p.kill('SIGKILL'); reject(new Error('conversão demorou demais')); }, 30000);
+    p.stdout.on('data', d => saida.push(d));
+    p.stderr.on('data', d => erros.push(d));
+    p.on('error', e => { clearTimeout(tempo); reject(e); });
+    p.on('close', c => { clearTimeout(tempo); c === 0 && saida.length ? resolve(Buffer.concat(saida)) : reject(new Error('ffmpeg ' + c + ' ' + Buffer.concat(erros).toString().slice(0, 120))); });
+    p.stdin.on('error', () => {});
+    p.stdin.end(buffer);
+  });
 }
 
 // ---------- Reenvio de mensagens que o celular não conseguiu abrir ----------
@@ -301,14 +348,29 @@ function telefoneDoParticipante(p) {
   const d = jid.split('@')[0].split(':')[0].replace(/\D/g, '');
   return d.length >= 10 && d.length <= 13 ? d : null;
 }
+// "Alguém indica um contador?", "preciso de alguém que faça site": quem pede indicação num grupo é oportunidade
+const PEDIDO_INDICACAO = /(algu[eé]m|quem)\s+(aqui\s+)?(me\s+|pode\s+me\s+)?(indica|indicar|recomenda|recomendar|conhece|tem\s+(uma?\s+)?indica[çc][ãa]o|sabe\s+de)|indica[çc](ão|ões|ao)\s+de|(preciso|procuro|estou\s+procurando|t[ôo]\s+procurando)\s+(de\s+)?(um|uma|algu[eé]m)\b|algu[eé]m\s+que\s+(fa[çz]a|trabalh|conserte|instale|venda)/i;
+async function registrarOportunidadeGrupo(msg, lida, grupoId, autorPhone) {
+  if (msg.key.fromMe || !lida || lida.tipo !== 'texto' || !PEDIDO_INDICACAO.test(lida.texto) || lida.texto.length > 600) return;
+  try {
+    await supa('POST', 'oportunidades_grupo', {
+      msg_id: msg.key.id, user_id: PROSPECTA_USER_ID, grupo_id: grupoId, grupo_nome: await nomeDoGrupo(grupoId),
+      autor_phone: autorPhone, autor_nome: msg.pushName || null, mensagem: lida.texto,
+      criado_em: new Date(((Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000)) * 1000)).toISOString(),
+    }, 'resolution=ignore-duplicates,return=minimal');
+    console.log('[grupo] pedido de indicação detectado');
+  } catch (e) { console.warn('[grupo] oportunidade não gravada:', e.message); }
+}
 async function registrarMensagemGrupo(msg) {
   if (!SUPABASE_KEY || !PROSPECTA_USER_ID) return;
   const grupoId = msg.key.remoteJid;
-  if (!(await gruposAcompanhados()).has(grupoId)) return;
   const lida = lerMensagem(msg);
   if (!lida || !lida.texto) return;
   const autorJid = msg.key.participantPn || msg.key.participantAlt || msg.key.participant || '';
   const autorPhone = autorJid.endsWith('@s.whatsapp.net') ? autorJid.split('@')[0].split(':')[0] : null;
+  registrarOportunidadeGrupo(msg, lida, grupoId, autorPhone);              // vale para qualquer grupo
+  if (!(await gruposAcompanhados()).has(grupoId)) return;                 // guardar a conversa: só os acompanhados
+  if (lida.midia) baixarMidia(msg, lida).then(b => guardarMidia(msg, lida, b, { grupoId })).catch(() => {});
   try {
     await supa('POST', 'grupo_mensagens', {
       msg_id: msg.key.id, user_id: PROSPECTA_USER_ID, grupo_id: grupoId, grupo_nome: await nomeDoGrupo(grupoId),
@@ -398,8 +460,10 @@ async function startSock() {
         const lida = lerMensagem(msg);
         if (!lida) continue;                                        // reação, aviso do sistema etc.
         let texto = lida.texto;
+        const bufferMidia = lida.midia ? await baixarMidia(msg, lida) : null;
+        if (bufferMidia) guardarMidia(msg, lida, bufferMidia, { phone });
         if (lida.tipo === 'audio') {
-          const transcrito = await transcreverAudio(msg);
+          const transcrito = await transcreverAudio(msg, bufferMidia);
           if (transcrito) texto = `🎤 Áudio: "${transcrito}"`;
         }
 
@@ -645,11 +709,12 @@ app.post('/send-message', checkAuth, async (req, res) => {
 // Envia qualquer tipo de mídia (documento, imagem, áudio, vídeo) — recebe o arquivo em base64
 app.post('/send-document', checkAuth, async (req, res) => {
   try {
-    const { phone, base64, filename, caption, tipo, mimetype } = req.body;
-    if (!phone || !base64) {
-      return res.status(400).json({ error: 'Envie "phone" e "base64" no corpo da requisição.' });
+    const { phone, grupoId, base64, filename, caption, tipo, mimetype } = req.body;
+    if ((!phone && !grupoId) || !base64) {
+      return res.status(400).json({ error: 'Envie "phone" (ou "grupoId") e "base64" no corpo da requisição.' });
     }
-    const jid = toWhatsAppJid(phone);
+    if (grupoId && !String(grupoId).endsWith('@g.us')) return res.status(400).json({ error: 'Grupo inválido.' });
+    const jid = grupoId || toWhatsAppJid(phone);
     if (!jid) {
       return res.status(400).json({ error: 'Número de telefone inválido.' });
     }
@@ -671,15 +736,21 @@ app.post('/send-document', checkAuth, async (req, res) => {
       // ogg/opus — forçar isso com outro formato (mp3, wav, etc.) fazia o envio falhar
       // silenciosamente. Se não for ogg/opus, manda como arquivo de áudio normal (ainda
       // toca certinho no WhatsApp, só não vira a bolinha redonda).
-      const ehOggOpus = (mimetype || '').includes('ogg');
-      payload = { audio: buffer, mimetype: mimetype || 'audio/mpeg', ptt: ehOggOpus };
+      let ehOggOpus = (mimetype || '').includes('ogg');
+      let audio = buffer, mime = mimetype || 'audio/mpeg';
+      if (!ehOggOpus) {
+        // Converte para ogg/opus: vira mensagem de voz de verdade e toca no iPhone
+        try { audio = await paraOggOpus(buffer); mime = 'audio/ogg; codecs=opus'; ehOggOpus = true; }
+        catch (e) { console.warn('[áudio] sem conversão, vai como arquivo:', e.message); }
+      }
+      payload = { audio, mimetype: mime, ptt: ehOggOpus };
     } else {
       payload = { document: buffer, fileName: filename || 'arquivo', mimetype: mimetype || 'application/octet-stream', caption: caption || '' };
     }
 
     const enviada = await emFila(async () => { const m = await sock.sendMessage(jid, payload); enviosHoje.n++; return m; });
     guardarMensagem(enviada);
-    registrarEnvio(enviada, String(phone).replace(/\D/g, ''));
+    if (!grupoId) registrarEnvio(enviada, String(phone).replace(/\D/g, ''));
     res.json({ success: true, phone, jid });
   } catch (err) {
     console.error('[send-document] erro:', err && err.message);

@@ -13,6 +13,7 @@
     "@whiskeysockets/baileys": "^6.7.17",
     "cors": "^2.8.5",
     "express": "^4.19.2",
+    "ffmpeg-static": "^5.2.0",
     "pino": "^9.4.0",
     "qrcode": "^1.5.4"
   }
