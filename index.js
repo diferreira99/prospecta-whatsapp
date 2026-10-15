@@ -601,10 +601,25 @@ async function startSock() {
         setTimeout(() => startSock(), 2000); // pequena espera antes de tentar de novo
       } else {
         publicarEstado(false, true, 'O WhatsApp desconectou este aparelho. Leia o QR code de novo.');
-        console.log('[Baileys] Sessão deslogada. Apague a pasta auth_info e escaneie o QR novamente.');
+        console.log('[Baileys] Sessão deslogada: apagando a sessão antiga e gerando QR novo.');
+        limparSessao();
+        setTimeout(() => startSock().catch(e => console.error('[Baileys] Erro ao reiniciar:', e && e.message)), 2000);
       }
     }
   });
+}
+
+// Apaga a sessão salva (para conectar outro número ou depois de o WhatsApp deslogar este aparelho)
+function limparSessao() {
+  try {
+    if (!fs.existsSync(AUTH_FOLDER)) return;
+    for (const f of fs.readdirSync(AUTH_FOLDER)) fs.rmSync(path.join(AUTH_FOLDER, f), { recursive: true, force: true });
+  } catch (e) { console.warn('[Baileys] não apagou a sessão:', e.message); }
+}
+function numeroConectado() {
+  const id = String(sock?.user?.id || '');
+  const d = id.split(':')[0].split('@')[0].replace(/\D/g, '');
+  return d || null;
 }
 
 startSock().catch((err) => {
@@ -699,7 +714,40 @@ app.get('/status', checkAuth, (req, res) => {
   res.json({
     connected: isConnected, qrPendente: !isConnected && !!latestQR, desde: estado.desde, motivo: estado.motivo,
     enviosHoje: enviosHoje.n, limiteDiarioServidor: LIMITE_DIARIO_SERVIDOR,
+    numero: isConnected ? numeroConectado() : null, nome: isConnected ? (sock?.user?.name || sock?.user?.notify || null) : null,
   });
+});
+
+// Desconecta o WhatsApp deste servidor (para trocar de número). Em seguida aparece um QR novo.
+app.post('/logout', checkAuth, async (req, res) => {
+  try {
+    const era = numeroConectado();
+    if (sock && isConnected) {
+      try { await sock.logout(); } catch (e) { console.warn('[logout]', e.message); }
+    } else {
+      limparSessao();
+      try { sock?.end?.(new Error('logout')); } catch (e) {}
+      setTimeout(() => startSock().catch(() => {}), 1500);
+    }
+    console.log('[logout] WhatsApp desconectado pelo app' + (era ? ' (final ' + era.slice(-4) + ')' : ''));
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Não consegui desconectar.' });
+  }
+});
+
+// Teste do alerta de lead quente: manda uma mensagem curta para o número de alerta (não conta como lead nem campanha)
+app.post('/alerta-teste', checkAuth, async (req, res) => {
+  try {
+    const d = String(req.body?.numero || '').replace(/\D/g, '');
+    if (d.length < 10 || d.length > 13) return res.status(400).json({ error: 'Número de alerta inválido.' });
+    if (!(await aguardarConexao(10000))) return res.status(503).json({ error: 'WhatsApp não conectado.', codigo: 'desconectado' });
+    const jid = toWhatsAppJid(d);
+    guardarMensagem(await sock.sendMessage(jid, { text: '🔔 Teste do Prospecta+: é assim que você vai receber o aviso quando um lead responder com interesse.' }));   // não vira "resposta manual"
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Não consegui enviar o teste.' });
+  }
 });
 
 // Versão em JSON do QR (para embutir direto no seu app, sem abrir outra página)
