@@ -584,9 +584,11 @@ async function startSock() {
     }
 
     if (connection === 'open') {
+      const foraDesde = !estado.conectado && estado.motivo !== 'iniciando' ? estado.desde : null;
       isConnected = true;
       latestQR = null;
       publicarEstado(true, false, '');
+      if (foraDesde) avisarVolta(foraDesde);
     }
 
     if (connection === 'close') {
@@ -608,6 +610,153 @@ async function startSock() {
     }
   });
 }
+
+
+// ---------- Avisos no WhatsApp de alerta (número de "lead quente" em Integrações) ----------
+// Campanha terminou / pausou no limite / foi cancelada / errou seguido, WhatsApp voltou depois de cair,
+// teto do servidor e resumo do dia às 18h. Sai deste mesmo WhatsApp para o número de alerta.
+// (Quando o WhatsApp cai, ele mesmo não consegue avisar: o aviso sai quando ele volta, com quanto tempo ficou fora.)
+const ALERTAS_ARQ = path.join(path.dirname(AUTH_FOLDER), 'alertas_estado.json');
+let alertasEstado = null;            // { campanhas: { id: 'fim'|'limite'|'cancelado'|'erros' }, resumo: 'dd/mm/aaaa', teto: 'dd/mm/aaaa' }
+let alertasPendentes = [];           // avisos que esperam o WhatsApp voltar
+function lerAlertasEstado() {
+  if (alertasEstado) return alertasEstado;
+  try { alertasEstado = JSON.parse(fs.readFileSync(ALERTAS_ARQ, 'utf8')); alertasEstado._novo = false; }
+  catch (e) { alertasEstado = { campanhas: {}, resumo: '', teto: '', _novo: true }; }
+  alertasEstado.campanhas = alertasEstado.campanhas || {};
+  return alertasEstado;
+}
+function salvarAlertasEstado() {
+  try { const { _novo, ...s } = alertasEstado; fs.writeFileSync(ALERTAS_ARQ, JSON.stringify(s)); } catch (e) { console.warn('[alertas] não salvou o estado:', e.message); }
+}
+let _numAlerta = { v: '', em: 0 }, _emailDono = { v: '', em: 0 };
+async function numeroAlerta() {
+  if (Date.now() - _numAlerta.em < 10 * 60 * 1000) return _numAlerta.v;
+  try {
+    const r = await supa('GET', `user_config?user_id=eq.${encodeURIComponent(PROSPECTA_USER_ID)}&select=numero_alerta&limit=1`);
+    _numAlerta = { v: String((r && r[0] && r[0].numero_alerta) || '').replace(/\D/g, ''), em: Date.now() };
+  } catch (e) { _numAlerta.em = Date.now(); }
+  return _numAlerta.v;
+}
+async function emailDono() {
+  if (_emailDono.v || Date.now() - _emailDono.em < 10 * 60 * 1000) return _emailDono.v;
+  _emailDono.em = Date.now();
+  try {
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${encodeURIComponent(PROSPECTA_USER_ID)}`, { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } });
+    if (r.ok) _emailDono.v = ((await r.json()) || {}).email || '';
+  } catch (e) {}
+  return _emailDono.v;
+}
+async function enviarAlerta(texto) {
+  if (!SUPABASE_KEY || !PROSPECTA_USER_ID) return false;
+  const num = await numeroAlerta();
+  if (!num || num.length < 10) return false;
+  if (!isConnected || !sock) { if (alertasPendentes.length < 5) alertasPendentes.push(texto); return false; }
+  try {
+    guardarMensagem(await sock.sendMessage(toWhatsAppJid(num), { text: String(texto).slice(0, 1500) }));   // não vira "resposta manual"
+    console.log('[alertas] aviso enviado');
+    return true;
+  } catch (e) { console.warn('[alertas] não enviou:', e.message); return false; }
+}
+function horaSP(iso) { return new Date(iso).toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' }); }
+function duracaoTxt(ms) { const m = Math.round(ms / 60000); return m < 60 ? m + ' min' : Math.floor(m / 60) + 'h' + String(m % 60).padStart(2, '0'); }
+
+// WhatsApp voltou depois de ficar fora mais de 3 minutos
+function avisarVolta(foraDesdeIso) {
+  const fora = Date.now() - new Date(foraDesdeIso).getTime();
+  const pend = alertasPendentes.splice(0);
+  if (fora < 3 * 60 * 1000 && !pend.length) return;
+  setTimeout(() => {
+    const txt = fora >= 3 * 60 * 1000 ? `✅ *WhatsApp voltou* às ${horaSP(new Date().toISOString())}\nFicou fora ${duracaoTxt(fora)} (desde ${horaSP(foraDesdeIso)}). As campanhas continuam sozinhas.` : '';
+    enviarAlerta([txt, ...pend].filter(Boolean).join('\n\n'));
+  }, 8000);
+}
+
+// Acompanha as campanhas pelo status que a automação grava
+async function verificarCampanhas() {
+  if (!SUPABASE_KEY || !PROSPECTA_USER_ID || !isConnected) return;
+  const email = await emailDono(); if (!email) return;
+  const est = lerAlertasEstado();
+  let linhas;
+  try {
+    const desde = new Date(Date.now() - 36 * 3600 * 1000).toISOString();
+    linhas = await supa('GET', `status_campanha?user_email=eq.${encodeURIComponent(email)}&created_at=gte.${encodeURIComponent(desde)}&select=campanhaId,idx,total,status,phone,log,created_at&order=id.asc&limit=5000`);
+  } catch (e) { return; }
+  const camps = {};
+  (linhas || []).forEach(l => {
+    const c = camps[l.campanhaId] = camps[l.campanhaId] || { id: l.campanhaId, total: 0, idx: new Set(), st: {}, phones: [], ini: l.created_at, fim: l.created_at, nome: '', ultimos: [] };
+    c.total = Math.max(c.total, parseInt(l.total, 10) || 0);
+    if (l.idx !== null && l.idx !== undefined && l.status !== 'cancelado') c.idx.add(String(l.idx));
+    c.st[l.status] = (c.st[l.status] || 0) + 1;
+    if (l.status === 'enviado' && l.phone) c.phones.push(String(l.phone).replace(/\D/g, ''));
+    c.fim = l.created_at;
+    c.ultimos.push(l.status); if (c.ultimos.length > 3) c.ultimos.shift();
+    const m = String(l.log || '').match(/\|\s*([^|]+)$/); if (m && !c.nome) c.nome = m[1].trim();
+  });
+  const primeira = est._novo; est._novo = false;
+  for (const c of Object.values(camps)) {
+    const antes = est.campanhas[c.id];
+    let agora = null;
+    if (c.st.cancelado) agora = 'cancelado';
+    else if (c.total && c.idx.size >= c.total) agora = 'fim';
+    else if (c.ultimos[c.ultimos.length - 1] === 'limite_diario') agora = 'limite';
+    else if (c.ultimos.length === 3 && c.ultimos.every(s => s === 'erro')) agora = 'erros';
+    if (!agora || antes === agora || antes === 'fim' || antes === 'cancelado') continue;
+    est.campanhas[c.id] = agora;
+    if (primeira || Date.now() - new Date(c.fim).getTime() > 6 * 3600 * 1000) continue;   // primeira leitura / coisa antiga: só registra
+    const nome = c.nome ? `"${c.nome}"` : 'sua campanha';
+    const env = c.st.enviado || 0, pul = c.st.pulado || 0, err = c.st.erro || 0, semWa = c.st.sem_whatsapp || 0;
+    const partes = [`${env} enviada${env === 1 ? '' : 's'}`, pul ? `${pul} pulada${pul === 1 ? '' : 's'} (já tinha recebido)` : '', semWa ? `${semWa} sem WhatsApp` : '', err ? `${err} com erro` : ''].filter(Boolean).join(' · ');
+    let txt = '';
+    if (agora === 'fim') {
+      let resp = '';
+      try {
+        if (c.phones.length) {
+          const lista = c.phones.slice(0, 150).map(p => `"${p}"`).join(',');
+          const r = await supa('GET', `leads?user_id=eq.${encodeURIComponent(PROSPECTA_USER_ID)}&phone=in.(${encodeURIComponent(lista)})&respondeu=eq.true&select=resposta_suspeita_bot`);
+          const hum = (r || []).filter(x => !x.resposta_suspeita_bot).length, bot = (r || []).length - hum;
+          resp = `\nRespostas até agora: ${hum} pessoa${hum === 1 ? '' : 's'}` + (bot ? ` (+${bot} automática${bot === 1 ? '' : 's'})` : '');
+        }
+      } catch (e) {}
+      txt = `🏁 *Campanha finalizada* ${nome}\n${partes}\n${horaSP(c.ini)} → ${horaSP(c.fim)} (${duracaoTxt(new Date(c.fim) - new Date(c.ini))})${resp}`;
+    } else if (agora === 'limite') txt = `⛔ *Limite diário atingido* em ${nome}\nAté agora: ${partes} (de ${c.total}). O resto continua sozinho no próximo dia, dentro do seu horário.`;
+    else if (agora === 'cancelado') txt = `⏹ *Campanha cancelada* ${nome}\n${partes} de ${c.total}.`;
+    else if (agora === 'erros') txt = `❌ *3 erros seguidos* em ${nome} (${c.idx.size} de ${c.total}).\nVale abrir o Prospecta+ e conferir a conexão do WhatsApp.`;
+    await enviarAlerta(txt);
+  }
+  salvarAlertasEstado();
+}
+
+// Resumo do dia às 18h (horário de Brasília), só se teve movimento
+async function resumoDoDia() {
+  if (!SUPABASE_KEY || !PROSPECTA_USER_ID || !isConnected) return;
+  const agora = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' }));
+  const est = lerAlertasEstado();
+  if (agora.getHours() !== 18 || est.resumo === diaSP()) return;
+  est.resumo = diaSP(); salvarAlertasEstado();
+  try {
+    const iniDia = new Date(Date.now() - (agora.getHours() * 3600 + agora.getMinutes() * 60 + agora.getSeconds()) * 1000).toISOString();
+    const uid = encodeURIComponent(PROSPECTA_USER_ID), q = encodeURIComponent(iniDia);
+    const email = await emailDono();
+    const [env, resp, sug, fu] = await Promise.all([
+      email ? supa('GET', `status_campanha?user_email=eq.${encodeURIComponent(email)}&status=eq.enviado&created_at=gte.${q}&select=id`) : [],
+      supa('GET', `leads?user_id=eq.${uid}&respondeu=eq.true&respondido_em=gte.${q}&select=resposta_suspeita_bot`),
+      supa('GET', `fila_sugestoes?user_id=eq.${uid}&status=eq.pendente&select=id`),
+      supa('GET', `fila_followups?user_id=eq.${uid}&status=eq.pendente&select=id`),
+    ]);
+    const nEnv = (env || []).length, hum = (resp || []).filter(x => !x.resposta_suspeita_bot).length, bot = (resp || []).length - hum;
+    const nSug = (sug || []).length, nFu = (fu || []).length;
+    if (!nEnv && !hum && !nSug && !nFu) return;
+    const linhas = [`📊 *Resumo de hoje* (${diaSP().slice(0, 5)})`, `📨 ${nEnv} empresa${nEnv === 1 ? '' : 's'} contatada${nEnv === 1 ? '' : 's'}`, `💬 ${hum} pessoa${hum === 1 ? '' : 's'} respondeu${hum === 1 ? '' : 'ram'}` + (bot ? ` (+${bot} resposta${bot === 1 ? '' : 's'} automática${bot === 1 ? '' : 's'})` : '')];
+    if (nSug) linhas.push(`📝 ${nSug} resposta${nSug === 1 ? '' : 's'} esperando você na aba Respostas`);
+    if (nFu) linhas.push(`🔁 ${nFu} follow-up${nFu === 1 ? '' : 's'} para aprovar`);
+    if (enviosHoje.dia === diaSP() && enviosHoje.n >= LIMITE_DIARIO_SERVIDOR * 0.8) linhas.push(`⚠️ O servidor usou ${enviosHoje.n} de ${LIMITE_DIARIO_SERVIDOR} mensagens do teto diário`);
+    await enviarAlerta(linhas.join('\n'));
+  } catch (e) { console.warn('[alertas] resumo do dia falhou:', e.message); }
+}
+const ALERTAS_INTERVALO_MS = parseInt(process.env.ALERTAS_INTERVALO_MS, 10) || 2 * 60 * 1000;
+setInterval(() => { verificarCampanhas().catch(() => {}); resumoDoDia().catch(() => {}); }, ALERTAS_INTERVALO_MS).unref();
+setTimeout(() => verificarCampanhas().catch(() => {}), Math.min(20000, ALERTAS_INTERVALO_MS)).unref();
 
 // Apaga a sessão salva (para conectar outro número ou depois de o WhatsApp deslogar este aparelho)
 function limparSessao() {
@@ -736,6 +885,14 @@ app.post('/logout', checkAuth, async (req, res) => {
   }
 });
 
+// Aviso livre para o número de alerta (ex.: automações). Corpo: { texto }
+app.post('/alerta', checkAuth, async (req, res) => {
+  const t = String(req.body?.texto || '').trim();
+  if (!t) return res.status(400).json({ error: 'Envie "texto".' });
+  const ok = await enviarAlerta(t.slice(0, 1500));
+  res.json({ ok, guardado: !ok && !isConnected });
+});
+
 // Teste do alerta de lead quente: manda uma mensagem curta para o número de alerta (não conta como lead nem campanha)
 app.post('/alerta-teste', checkAuth, async (req, res) => {
   try {
@@ -779,6 +936,7 @@ app.post('/send-message', checkAuth, async (req, res) => {
     }
     if (!dentroDoTeto()) {
       console.warn(`[trava] teto diário do servidor atingido (${LIMITE_DIARIO_SERVIDOR}) — envio recusado`);
+      try { const e = lerAlertasEstado(); if (e.teto !== diaSP()) { e.teto = diaSP(); salvarAlertasEstado(); enviarAlerta(`🛑 *Teto de segurança do servidor atingido* (${LIMITE_DIARIO_SERVIDOR} mensagens hoje).\nNovos envios ficam travados até amanhã.`); } } catch (er) {}
       return res.status(429).json({ error: `Limite de segurança do servidor atingido (${LIMITE_DIARIO_SERVIDOR} mensagens hoje).`, codigo: 'teto_diario' });
     }
 
