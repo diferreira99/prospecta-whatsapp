@@ -7,6 +7,9 @@
  *   POST /send-message    -> { phone: "5511999999999", message: "texto", digitandoMs?: 6000 }
  *   POST /send-document   -> { phone: "5511999999999", base64: "...", filename: "relatorio.pdf", caption: "texto opcional" }
  *   POST /check-number    -> { phone: "5511999999999" } -> { exists: true/false }
+ *   GET  /groups          -> grupos em que este número participa (nome, tamanho, quantos números visíveis)
+ *   GET  /groups/:id/participants -> participantes com número visível (o WhatsApp esconde o resto)
+ *   POST /send-group      -> { grupoId: "1203...@g.us", message: "texto" }
  *
  * Variáveis de ambiente:
  *   API_TOKEN            -> token simples para proteger as rotas (defina no Railway)
@@ -276,6 +279,52 @@ async function registrarRespostaManual(msg, phone, lida) {
   } catch (e) { console.warn('[você respondeu pelo celular] não gravou:', e.message); }
 }
 
+// ---------- Grupos ----------
+// Só os grupos que você marcou para acompanhar no Inbox têm mensagens gravadas (tabela grupos_config).
+let _gruposAcompanhados = { ids: new Set(), em: 0 };
+async function gruposAcompanhados() {
+  if (Date.now() - _gruposAcompanhados.em < 60 * 1000) return _gruposAcompanhados.ids;
+  try {
+    const r = await supa('GET', `grupos_config?user_id=eq.${encodeURIComponent(PROSPECTA_USER_ID)}&acompanhar=eq.true&select=grupo_id`);
+    _gruposAcompanhados = { ids: new Set((r || []).map(x => x.grupo_id)), em: Date.now() };
+  } catch (e) { _gruposAcompanhados.em = Date.now(); }
+  return _gruposAcompanhados.ids;
+}
+const _nomesGrupos = new Map();
+async function nomeDoGrupo(id) {
+  if (_nomesGrupos.has(id)) return _nomesGrupos.get(id);
+  try { const m = await sock.groupMetadata(id); _nomesGrupos.set(id, m.subject || ''); return m.subject || ''; } catch (e) { return ''; }
+}
+function telefoneDoParticipante(p) {
+  const jid = (p && (p.jid || (String(p.id || '').endsWith('@s.whatsapp.net') ? p.id : ''))) || '';
+  if (!jid.endsWith('@s.whatsapp.net')) return null;
+  const d = jid.split('@')[0].split(':')[0].replace(/\D/g, '');
+  return d.length >= 10 && d.length <= 13 ? d : null;
+}
+async function registrarMensagemGrupo(msg) {
+  if (!SUPABASE_KEY || !PROSPECTA_USER_ID) return;
+  const grupoId = msg.key.remoteJid;
+  if (!(await gruposAcompanhados()).has(grupoId)) return;
+  const lida = lerMensagem(msg);
+  if (!lida || !lida.texto) return;
+  const autorJid = msg.key.participantPn || msg.key.participantAlt || msg.key.participant || '';
+  const autorPhone = autorJid.endsWith('@s.whatsapp.net') ? autorJid.split('@')[0].split(':')[0] : null;
+  try {
+    await supa('POST', 'grupo_mensagens', {
+      msg_id: msg.key.id, user_id: PROSPECTA_USER_ID, grupo_id: grupoId, grupo_nome: await nomeDoGrupo(grupoId),
+      autor_phone: msg.key.fromMe ? null : autorPhone, autor_nome: msg.key.fromMe ? 'Você' : (msg.pushName || null),
+      mensagem: lida.texto, tipo: lida.tipo, de_mim: !!msg.key.fromMe,
+      criado_em: new Date(((Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000)) * 1000)).toISOString(),
+    }, 'resolution=ignore-duplicates,return=minimal');
+  } catch (e) { console.warn('[grupo] não gravou a mensagem:', e.message); }
+}
+// Limpeza: mensagens de grupo com mais de 30 dias saem do banco (uma vez por dia)
+setInterval(() => {
+  if (!SUPABASE_KEY || !PROSPECTA_USER_ID) return;
+  const limite = new Date(Date.now() - 30 * 86400000).toISOString();
+  supa('DELETE', `grupo_mensagens?user_id=eq.${PROSPECTA_USER_ID}&criado_em=lt.${encodeURIComponent(limite)}`, undefined, 'return=minimal').catch(() => {});
+}, 24 * 60 * 60 * 1000).unref();
+
 // ---------- Middleware simples de autenticação por token ----------
 function checkAuth(req, res, next) {
   if (!API_TOKEN) return next(); // sem token configurado = sem checagem (defina API_TOKEN!)
@@ -314,7 +363,16 @@ async function startSock() {
     for (const msg of messages) {
       try {
         if (!msg.message) continue;
-        if (msg.key.remoteJid?.endsWith('@g.us') || msg.key.remoteJid === 'status@broadcast') continue; // grupos e status
+        if (msg.key.remoteJid === 'status@broadcast') continue;   // status (stories) não interessa
+        // Grupos: nunca viram lead nem vão para a IA; só ficam gravados se você acompanha o grupo no Inbox
+        if (msg.key.remoteJid?.endsWith('@g.us')) {
+          const idadeSeg = Date.now() / 1000 - (Number(msg.messageTimestamp) || 0);
+          if (type === 'notify' || idadeSeg < 120) {
+            if (msg.key.fromMe && mensagensEnviadas.has(msg.key.id)) continue;   // já gravada pelo app
+            registrarMensagemGrupo(msg);
+          }
+          continue;
+        }
 
         // Mensagem sua: só interessa a que você digitou no celular, em tempo real
         if (msg.key.fromMe) {
@@ -381,6 +439,8 @@ async function startSock() {
       } catch (e) { /* nunca derruba o servidor */ }
     }
   });
+
+  sock.ev.on('groups.update', (lista) => { for (const g of lista || []) if (g.id && g.subject) _nomesGrupos.set(g.id, g.subject); });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -643,6 +703,69 @@ app.post('/check-number', checkAuth, async (req, res) => {
   } catch (err) {
     console.error('[check-number] erro:', err && err.message);
     res.status(500).json({ error: err.message || 'Erro ao verificar número.' });
+  }
+});
+
+// Grupos em que este número participa. Não manda nada para ninguém: só lê.
+app.get('/groups', checkAuth, async (req, res) => {
+  try {
+    if (!(await aguardarConexao(10000))) return res.status(503).json({ error: 'WhatsApp não conectado.', codigo: 'desconectado' });
+    const todos = await sock.groupFetchAllParticipating();
+    const meu = String(sock?.user?.id || '').split(':')[0].split('@')[0];
+    const grupos = Object.values(todos || {}).map(g => {
+      _nomesGrupos.set(g.id, g.subject || '');
+      const parts = g.participants || [];
+      const comNumero = parts.filter(p => { const t = telefoneDoParticipante(p); return t && t !== meu; }).length;
+      const eu = parts.find(p => telefoneDoParticipante(p) === meu);
+      return {
+        id: g.id, nome: g.subject || '(sem nome)', participantes: g.size || parts.length, comNumero,
+        souAdmin: !!(eu && eu.admin), soAdminsFalam: !!g.announce, comunidade: !!g.isCommunity,
+      };
+    }).sort((a, b) => b.comNumero - a.comNumero);
+    res.json({ grupos });
+  } catch (err) {
+    console.error('[groups] erro:', err && err.message);
+    res.status(500).json({ error: err.message || 'Erro ao listar grupos.' });
+  }
+});
+
+app.get('/groups/:id/participants', checkAuth, async (req, res) => {
+  try {
+    if (!(await aguardarConexao(10000))) return res.status(503).json({ error: 'WhatsApp não conectado.', codigo: 'desconectado' });
+    const id = String(req.params.id || '');
+    if (!id.endsWith('@g.us')) return res.status(400).json({ error: 'Grupo inválido.' });
+    const m = await sock.groupMetadata(id);
+    const meu = String(sock?.user?.id || '').split(':')[0].split('@')[0];
+    const vistos = new Set();
+    const participantes = [];
+    let escondidos = 0;
+    for (const p of m.participants || []) {
+      const t = telefoneDoParticipante(p);
+      if (!t) { escondidos++; continue; }
+      if (t === meu || vistos.has(t)) continue;
+      vistos.add(t);
+      participantes.push({ phone: t, admin: !!p.admin });
+    }
+    res.json({ id, nome: m.subject || '', participantes, escondidos });
+  } catch (err) {
+    console.error('[groups/participants] erro:', err && err.message);
+    res.status(500).json({ error: err.message || 'Erro ao ler o grupo.' });
+  }
+});
+
+// Envia texto para um grupo (respostas pelo Inbox)
+app.post('/send-group', checkAuth, async (req, res) => {
+  try {
+    const { grupoId, message } = req.body || {};
+    if (!grupoId || !String(grupoId).endsWith('@g.us') || !message) return res.status(400).json({ error: 'Envie "grupoId" (…@g.us) e "message".' });
+    if (!(await aguardarConexao(15000))) return res.status(503).json({ error: 'WhatsApp não conectado.', codigo: 'desconectado' });
+    if (!dentroDoTeto()) return res.status(429).json({ error: `Limite de segurança do servidor atingido (${LIMITE_DIARIO_SERVIDOR} mensagens hoje).`, codigo: 'teto_diario' });
+    const enviada = await emFila(async () => { const m = await sock.sendMessage(grupoId, { text: message }); enviosHoje.n++; return m; });
+    guardarMensagem(enviada);
+    res.json({ success: true, id: enviada?.key?.id || null });
+  } catch (err) {
+    console.error('[send-group] erro:', err && err.message);
+    res.status(500).json({ error: err.message || 'Erro ao enviar para o grupo.' });
   }
 });
 
