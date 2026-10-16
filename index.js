@@ -522,7 +522,23 @@ async function checkAuth(req, res, next) {
 }
 
 // ---------- Conexão com o WhatsApp ----------
+// Vigia da reconexão: às vezes a nova conexão fica parada no meio (sem "conectado", sem erro e sem QR)
+// e o servidor ficava "Reconectando" para sempre. Se passar de 90 s assim, derruba essa tentativa e tenta de novo.
+let _sockIniciadoEm = 0, _tentativasTravadas = 0;
+setInterval(() => {
+  if (isConnected || latestQR || !_sockIniciadoEm) return;
+  const parado = Date.now() - _sockIniciadoEm;
+  if (parado < 90000) return;
+  _tentativasTravadas++;
+  console.log(`[conexão] reconexão parada há ${Math.round(parado / 1000)} s: tentando de novo (tentativa ${_tentativasTravadas})`);
+  const velho = sock;
+  _sockIniciadoEm = Date.now();
+  try { if (velho) { velho.ev.removeAllListeners('connection.update'); velho.end(new Error('reconexão travada')); } } catch (e) {}
+  startSock().catch(e => console.error('[Baileys] Erro ao reiniciar:', e && e.message));
+}, 30000);
+
 async function startSock() {
+  _sockIniciadoEm = Date.now();
   if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
@@ -645,6 +661,7 @@ async function startSock() {
     }
 
     if (connection === 'open') {
+      _tentativasTravadas = 0;
       const foraDesde = !estado.conectado && estado.motivo !== 'iniciando' ? estado.desde : null;
       isConnected = true;
       latestQR = null;
