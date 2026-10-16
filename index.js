@@ -64,6 +64,22 @@ const {
 
 const app = express();
 app.use(cors());
+// Limite geral por endereço (antes de tudo): uso normal fica bem abaixo (conferir números da busca ≈ 300/min).
+// Quem passa disso espera o próximo minuto — evita que alguém derrube o servidor com pedidos em massa.
+const POR_MINUTO_IP = Number(process.env.LIMITE_POR_MINUTO) || 600;
+const _porMinuto = new Map();   // ip -> { min, n }
+app.use((req, res, next) => {
+  const ip = ipDe(req), min = Math.floor(Date.now() / 60000);
+  let c = _porMinuto.get(ip);
+  if (!c || c.min !== min) { c = { min, n: 0 }; _porMinuto.set(ip, c); }
+  if (++c.n > POR_MINUTO_IP) {
+    if (c.n === POR_MINUTO_IP + 1) console.warn(`[segurança] ${ip} passou de ${POR_MINUTO_IP} pedidos no minuto`);
+    res.set('Retry-After', String(60 - Math.floor(Date.now() / 1000) % 60));
+    return res.status(429).json({ error: 'Muitos pedidos seguidos. Espere um minuto.' });
+  }
+  if (_porMinuto.size > 5000) for (const [k, v] of _porMinuto) if (v.min < min) _porMinuto.delete(k);
+  next();
+});
 // Confere o acesso ANTES de ler o corpo: sem token/login, nem os 50 MB de upload são aceitos.
 app.use((req, res, next) => (req.path === '/' || req.method === 'OPTIONS') ? next() : checkAuth(req, res, next));
 app.use(express.json({ limit: '50mb' })); // PDFs/mídias em base64 passam fácil do limite padrão (100kb)
