@@ -90,6 +90,29 @@ const API_TOKEN = process.env.API_TOKEN || ''; // se vazio, roda sem checagem (d
 // senão a sessão se perde a cada novo deploy e é preciso ler o QR de novo. Sem AUTH_DIR, funciona como antes.
 const AUTH_FOLDER = process.env.AUTH_DIR || path.join(__dirname, 'auth_info');
 
+// ---------- Vários números no mesmo servidor (um ativo por vez) ----------
+// Cada número guarda a própria sessão numa pasta; trocar é desligar um e ligar o outro com a sessão salva
+// (QR só na primeira vez de cada número). O número de antes ("principal") continua na pasta de sempre.
+// Cada número tem a própria contagem do dia (teto do servidor) e o próprio modo pós-restrição.
+const SESSOES_DIR = process.env.SESSOES_DIR || path.join(path.dirname(AUTH_FOLDER), 'numeros');
+const NUMEROS_ARQ = path.join(SESSOES_DIR, 'numeros.json');
+let _numeros = null;   // { ativo, lista: { id: { apelido, numero, nome, criadoEm, ultimaConexao, caiuEm, rampa, envios } } }
+function lerNumeros() {
+  if (_numeros) return _numeros;
+  try { _numeros = JSON.parse(fs.readFileSync(NUMEROS_ARQ, 'utf8')); } catch (e) { _numeros = null; }
+  if (!_numeros || !_numeros.lista) _numeros = { ativo: 'principal', lista: { principal: { apelido: 'Principal', criadoEm: new Date().toISOString() } } };
+  if (!_numeros.lista[_numeros.ativo]) _numeros.ativo = Object.keys(_numeros.lista)[0];
+  return _numeros;
+}
+function salvarNumeros() {
+  try { fs.mkdirSync(SESSOES_DIR, { recursive: true }); fs.writeFileSync(NUMEROS_ARQ, JSON.stringify(_numeros)); }
+  catch (e) { console.warn('[números] não salvou:', e.message); }
+}
+function pastaSessao(id) { return id === 'principal' ? AUTH_FOLDER : path.join(SESSOES_DIR, String(id).replace(/[^a-z0-9_-]/gi, '')); }
+function pastaAtual() { return pastaSessao(lerNumeros().ativo); }
+function temSessao(id) { try { return fs.existsSync(path.join(pastaSessao(id), 'creds.json')); } catch (e) { return false; } }
+function numeroAtivoMeta() { const n = lerNumeros(); return n.lista[n.ativo]; }
+
 // Captura de resposta (só escuta e registra — NUNCA responde nada automaticamente)
 const N8N_WEBHOOK_RESPOSTA = process.env.N8N_WEBHOOK_RESPOSTA || 'https://primary-production-c1c7c.up.railway.app/webhook/receber-resposta';
 const PROSPECTA_USER_ID = process.env.PROSPECTA_USER_ID || ''; // UUID do usuário no Supabase Auth (defina no Railway!)
@@ -539,9 +562,10 @@ setInterval(() => {
 
 async function startSock() {
   _sockIniciadoEm = Date.now();
-  if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+  const pasta = pastaAtual();
+  if (!fs.existsSync(pasta)) fs.mkdirSync(pasta, { recursive: true });
 
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+  const { state, saveCreds } = await useMultiFileAuthState(pasta);
   const { version } = await fetchLatestBaileysVersion();
   console.log('[Baileys] Usando versão do protocolo WA:', version);
 
@@ -666,6 +690,7 @@ async function startSock() {
       isConnected = true;
       latestQR = null;
       publicarEstado(true, false, '');
+      try { const m = numeroAtivoMeta(); m.numero = numeroConectado() || m.numero; m.nome = sock?.user?.name || sock?.user?.notify || m.nome || null; m.ultimaConexao = new Date().toISOString(); delete m.caiuEm; salvarNumeros(); } catch (e) {}
       if (foraDesde) avisarVolta(foraDesde);
     }
 
@@ -682,7 +707,10 @@ async function startSock() {
       } else {
         publicarEstado(false, true, 'O WhatsApp desconectou este aparelho. Leia o QR code de novo.');
         console.log('[Baileys] Sessão deslogada: apagando a sessão antiga e gerando QR novo.');
-        if (Date.now() - _saidaPedidaEm > 60000) protegerAposQueda().catch(e => console.warn('[proteção]', e.message));
+        if (Date.now() - _saidaPedidaEm > 60000) {
+          protegerAposQueda().catch(e => console.warn('[proteção]', e.message));
+          try { numeroAtivoMeta().caiuEm = new Date().toISOString(); salvarNumeros(); } catch (e) {}
+        }
         limparSessao();
         setTimeout(() => startSock().catch(e => console.error('[Baileys] Erro ao reiniciar:', e && e.message)), 2000);
       }
@@ -921,8 +949,9 @@ setInterval(() => { freioDeBloqueio().catch(() => {}); }, ALERTAS_INTERVALO_MS).
 // Apaga a sessão salva (para conectar outro número ou depois de o WhatsApp deslogar este aparelho)
 function limparSessao() {
   try {
-    if (!fs.existsSync(AUTH_FOLDER)) return;
-    for (const f of fs.readdirSync(AUTH_FOLDER)) fs.rmSync(path.join(AUTH_FOLDER, f), { recursive: true, force: true });
+    const pasta = pastaAtual();
+    if (!fs.existsSync(pasta)) return;
+    for (const f of fs.readdirSync(pasta)) fs.rmSync(path.join(pasta, f), { recursive: true, force: true });
   } catch (e) { console.warn('[Baileys] não apagou a sessão:', e.message); }
 }
 function numeroConectado() {
@@ -952,7 +981,7 @@ async function aguardarConexao(ms) {
 }
 
 // ---------- Trava de segurança: teto diário e intervalo mínimo ----------
-let enviosHoje = { dia: '', n: 0 };
+let enviosHoje = (() => { try { const e = numeroAtivoMeta().envios; return e && e.dia ? e : { dia: '', n: 0 }; } catch (x) { return { dia: '', n: 0 }; } })();
 let ultimoEnvio = 0;
 let filaEnvio = Promise.resolve();
 function diaSP() { return new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' }); }
@@ -1024,7 +1053,80 @@ app.get('/status', checkAuth, (req, res) => {
     connected: isConnected, qrPendente: !isConnected && !!latestQR, desde: estado.desde, motivo: estado.motivo,
     enviosHoje: enviosHoje.n, limiteDiarioServidor: LIMITE_DIARIO_SERVIDOR,
     numero: isConnected ? numeroConectado() : null, nome: isConnected ? (sock?.user?.name || sock?.user?.notify || null) : null,
+    numeroAtivo: { id: lerNumeros().ativo, apelido: numeroAtivoMeta().apelido, numero: isConnected ? numeroConectado() : (numeroAtivoMeta().numero || null) },
   });
+});
+
+// ---------- Números: listar, adicionar, trocar o ativo, renomear, remover ----------
+function listaNumeros() {
+  const n = lerNumeros();
+  return Object.entries(n.lista).map(([id, m]) => ({
+    id, apelido: m.apelido || 'Número', numero: id === n.ativo && isConnected ? numeroConectado() : (m.numero || null), nome: m.nome || null,
+    ativo: id === n.ativo, conectado: id === n.ativo && isConnected, temSessao: temSessao(id),
+    ultimaConexao: id === n.ativo && isConnected ? new Date().toISOString() : (m.ultimaConexao || null), caiuEm: m.caiuEm || null, criadoEm: m.criadoEm || null,
+  }));
+}
+let _trocando = false;
+async function trocarNumero(id) {
+  const n = lerNumeros();
+  if (!n.lista[id]) throw Object.assign(new Error('Número não encontrado.'), { status: 404 });
+  if (id === n.ativo) return;
+  if (_trocando) throw Object.assign(new Error('Já estou trocando de número. Espere alguns segundos.'), { status: 409 });
+  const ativas = await campanhasAtivas().catch(() => []);
+  if (ativas.length) throw Object.assign(new Error('Tem campanha enviando agora. Espere terminar (ou cancele) para trocar de número.'), { status: 409 });
+  _trocando = true;
+  try {
+    const antes = n.lista[n.ativo];
+    // guarda a contagem do dia e o modo pós-restrição do número que sai; carrega os do que entra
+    if (enviosHoje.dia !== diaSP()) enviosHoje = { dia: diaSP(), n: 0 };
+    antes.envios = { ...enviosHoje };
+    const novo = n.lista[id];
+    await salvarProtecao(v => {
+      antes.rampa = { ...v.rampa };
+      const r = novo.rampa || { ativo: false, desde: null };
+      v.rampa = { ...v.rampa, ativo: !!r.ativo, desde: r.desde || null };
+    }).catch(() => {});
+    enviosHoje = novo.envios && novo.envios.dia === diaSP() ? { ...novo.envios } : { dia: diaSP(), n: 0 };
+    _saidaPedidaEm = Date.now();                 // trocar não é queda: não cancela campanha nem liga a rampa
+    const velho = sock;
+    try { velho?.ev?.removeAllListeners('connection.update'); velho?.end?.(new Error('troca de número')); } catch (e) {}
+    isConnected = false; latestQR = null;
+    n.ativo = id; salvarNumeros();
+    publicarEstado(false, false, 'Trocando de número');
+    console.log(`[números] trocou para "${novo.apelido}"` + (novo.numero ? ' (final ' + String(novo.numero).slice(-4) + ')' : ' (novo: vai pedir QR)'));
+    await startSock();
+  } finally { _trocando = false; }
+}
+app.get('/numeros', checkAuth, (req, res) => res.json({ ativo: lerNumeros().ativo, numeros: listaNumeros() }));
+app.post('/numeros', checkAuth, async (req, res) => {
+  try {
+    const n = lerNumeros();
+    if (Object.keys(n.lista).length >= 10) return res.status(400).json({ error: 'Máximo de 10 números.' });
+    const id = 'n' + Date.now().toString(36);
+    n.lista[id] = { apelido: String((req.body && req.body.apelido) || 'Reserva').trim().slice(0, 40) || 'Reserva', criadoEm: new Date().toISOString() };
+    salvarNumeros();
+    try { await trocarNumero(id); } catch (e) { delete n.lista[id]; salvarNumeros(); throw e; }   // não ficou ligado: não deixa na lista
+    res.json({ ok: true, id, numeros: listaNumeros() });
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+app.post('/numeros/usar', checkAuth, async (req, res) => {
+  try { await trocarNumero(String((req.body && req.body.id) || '')); res.json({ ok: true, numeros: listaNumeros() }); }
+  catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+app.post('/numeros/apelido', checkAuth, (req, res) => {
+  const n = lerNumeros(), m = n.lista[String((req.body && req.body.id) || '')];
+  if (!m) return res.status(404).json({ error: 'Número não encontrado.' });
+  m.apelido = String(req.body.apelido || '').trim().slice(0, 40) || m.apelido; salvarNumeros();
+  res.json({ ok: true, numeros: listaNumeros() });
+});
+app.post('/numeros/remover', checkAuth, (req, res) => {
+  const n = lerNumeros(), id = String((req.body && req.body.id) || '');
+  if (!n.lista[id]) return res.status(404).json({ error: 'Número não encontrado.' });
+  if (id === n.ativo) return res.status(400).json({ error: 'Esse é o número ligado agora. Troque para outro antes de remover.' });
+  if (id === 'principal') return res.status(400).json({ error: 'O número principal não pode ser removido; dá para trocar o número dele lendo outro QR.' });
+  try { fs.rmSync(pastaSessao(id), { recursive: true, force: true }); } catch (e) {}
+  delete n.lista[id]; salvarNumeros();
+  res.json({ ok: true, numeros: listaNumeros() });
 });
 
 // Desconecta o WhatsApp deste servidor (para trocar de número). Em seguida aparece um QR novo.
