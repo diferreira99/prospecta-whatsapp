@@ -1299,6 +1299,70 @@ app.post('/send-message', checkAuth, async (req, res) => {
   }
 });
 
+// ---------- Áudio com a voz da IA ----------
+// A IA (voz pronta da OpenAI, com a chave que o administrador gravou) fala o texto e o servidor manda como
+// mensagem de voz do WhatsApp (o "microfone"). /tts devolve só o áudio, para ouvir antes de enviar.
+const VOZES_AUDIO = { feminina: 'coral', masculina: 'ash' };
+const _audioUso = [];
+async function gerarAudio(texto, voz) {
+  const agora = Date.now();
+  while (_audioUso.length && _audioUso[0] < agora - 60000) _audioUso.shift();
+  if (_audioUso.length >= 20) throw Object.assign(new Error('Muitos áudios em um minuto. Espere um pouco.'), { status: 429 });
+  const t = String(texto || '').replace(/\s+/g, ' ').trim();
+  if (!t) throw Object.assign(new Error('Escreva o texto do áudio.'), { status: 400 });
+  if (t.length > 700) throw Object.assign(new Error('Texto longo demais para um áudio (máximo 700 caracteres, uns 45 segundos).'), { status: 400 });
+  if (!SUPABASE_KEY || !PROSPECTA_USER_ID) throw Object.assign(new Error('Servidor sem acesso ao banco.'), { status: 503 });
+  const cfg = await iaConfig();
+  if (!cfg.openai_key) throw Object.assign(new Error('O áudio usa a voz da OpenAI: falta a chave da OpenAI em Integrações → IA para Mensagens.'), { status: 400 });
+  _audioUso.push(agora);
+  const pedir = modelo => fetch('https://api.openai.com/v1/audio/speech', {
+    method: 'POST', headers: { Authorization: 'Bearer ' + cfg.openai_key, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: modelo, voice: VOZES_AUDIO[voz] || VOZES_AUDIO.feminina, input: t, response_format: 'opus',
+      ...(modelo === 'tts-1' ? {} : { instructions: 'Fale em português do Brasil, com sotaque brasileiro natural, tom simpático e descontraído, como alguém gravando um áudio rápido no WhatsApp para um cliente. Ritmo de conversa, sem soar como locutor.' }) }),
+  });
+  let r = await pedir('gpt-4o-mini-tts');
+  if (r.status === 400 || r.status === 404) r = await pedir('tts-1');   // conta sem o modelo novo: usa o anterior
+  if (!r.ok) throw Object.assign(new Error('A IA não gerou o áudio (' + r.status + ').'), { status: 502 });
+  return Buffer.from(await r.arrayBuffer());
+}
+app.post('/tts', checkAuth, async (req, res) => {
+  try {
+    const audio = await gerarAudio(req.body?.texto, req.body?.voz);
+    res.set('Content-Type', 'audio/ogg').set('Cache-Control', 'no-store').send(audio);
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+app.post('/send-audio', checkAuth, async (req, res) => {
+  try {
+    const phone = req.body?.phone;
+    const jid = toWhatsAppJid(phone);
+    if (!jid) return res.status(400).json({ error: 'Número de telefone inválido.' });
+    if (!(await aguardarConexao(15000))) return res.status(503).json({ error: 'WhatsApp não conectado.', codigo: 'desconectado' });
+    if (!dentroDoTeto()) return res.status(429).json({ error: `Limite de segurança do servidor atingido (${LIMITE_DIARIO_SERVIDOR} mensagens hoje).`, codigo: 'teto_diario' });
+    try { const r = await sock.onWhatsApp(jid); if (Array.isArray(r) && r.length === 0) return res.status(404).json({ error: 'Este número não tem WhatsApp.', codigo: 'sem_whatsapp' }); } catch (e) {}
+    const audio = await gerarAudio(req.body?.texto, req.body?.voz);
+    // "gravando áudio…" por um tempo proporcional ao texto, como uma pessoa gravando
+    const gravando = Math.min(12000, 2500 + String(req.body?.texto || '').length * 25);
+    const enviada = await emFila(async () => {
+      try {
+        await sock.presenceSubscribe(jid).catch(() => {});
+        await sock.sendPresenceUpdate('recording', jid);
+        await new Promise(r => setTimeout(r, gravando));
+        await sock.sendPresenceUpdate('paused', jid);
+      } catch (e) { /* enfeite: se falhar, envia assim mesmo */ }
+      const m = await sock.sendMessage(jid, { audio, mimetype: 'audio/ogg; codecs=opus', ptt: true });
+      enviosHoje.n++;
+      return m;
+    });
+    guardarMensagem(enviada);
+    registrarEnvio(enviada, String(phone).replace(/\D/g, ''));
+    console.log('[áudio] enviado para final ' + String(phone).replace(/\D/g, '').slice(-4) + ` (${Math.round(audio.length / 1024)} KB)`);
+    res.json({ success: true, id: enviada?.key?.id || null });
+  } catch (e) {
+    console.error('[send-audio] erro:', e && e.message);
+    res.status(e.status || 500).json({ error: e.message || 'Erro ao enviar o áudio.' });
+  }
+});
+
 // Envia qualquer tipo de mídia (documento, imagem, áudio, vídeo) — recebe o arquivo em base64
 app.post('/send-document', checkAuth, async (req, res) => {
   try {
