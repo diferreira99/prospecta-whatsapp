@@ -1304,7 +1304,8 @@ app.post('/send-message', checkAuth, async (req, res) => {
 // mensagem de voz do WhatsApp (o "microfone"). /tts devolve só o áudio, para ouvir antes de enviar.
 const VOZES_AUDIO = { feminina: 'coral', masculina: 'ash' };
 const _audioUso = [];
-async function gerarAudio(texto, voz) {
+// formato 'mp3' só para ouvir no app (o iPhone não toca OGG no navegador); para o WhatsApp é sempre opus.
+async function gerarAudio(texto, voz, formato) {
   const agora = Date.now();
   while (_audioUso.length && _audioUso[0] < agora - 60000) _audioUso.shift();
   if (_audioUso.length >= 20) throw Object.assign(new Error('Muitos áudios em um minuto. Espere um pouco.'), { status: 429 });
@@ -1317,7 +1318,7 @@ async function gerarAudio(texto, voz) {
   _audioUso.push(agora);
   const pedir = modelo => fetch('https://api.openai.com/v1/audio/speech', {
     method: 'POST', headers: { Authorization: 'Bearer ' + cfg.openai_key, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: modelo, voice: VOZES_AUDIO[voz] || VOZES_AUDIO.feminina, input: t, response_format: 'opus',
+    body: JSON.stringify({ model: modelo, voice: VOZES_AUDIO[voz] || VOZES_AUDIO.feminina, input: t, response_format: formato === 'mp3' ? 'mp3' : 'opus',
       ...(modelo === 'tts-1' ? {} : { instructions: 'Fale em português do Brasil, com sotaque brasileiro natural, tom simpático e descontraído, como alguém gravando um áudio rápido no WhatsApp para um cliente. Ritmo de conversa, sem soar como locutor.' }) }),
   });
   let r = await pedir('gpt-4o-mini-tts');
@@ -1327,8 +1328,9 @@ async function gerarAudio(texto, voz) {
 }
 app.post('/tts', checkAuth, async (req, res) => {
   try {
-    const audio = await gerarAudio(req.body?.texto, req.body?.voz);
-    res.set('Content-Type', 'audio/ogg').set('Cache-Control', 'no-store').send(audio);
+    const mp3 = req.body?.formato === 'mp3';
+    const audio = await gerarAudio(req.body?.texto, req.body?.voz, mp3 ? 'mp3' : 'opus');
+    res.set('Content-Type', mp3 ? 'audio/mpeg' : 'audio/ogg').set('Cache-Control', 'no-store').send(audio);
   } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 app.post('/send-audio', checkAuth, async (req, res) => {
