@@ -615,6 +615,7 @@ async function startSock() {
           const phone = await telefoneDaConversa(msg.key);
           const meu = String(sock?.user?.id || '').split(':')[0].split('@')[0];
           if (phone && phone !== meu) registrarRespostaManual(msg, phone, lida);   // recado para si mesmo não conta
+          else if (phone && phone === meu && pareceLancamentoOrdena(lida.texto)) encaminharOrdena(phone, lida.texto);
           continue;
         }
 
@@ -754,6 +755,23 @@ async function emailDono() {
   } catch (e) {}
   return _emailDono.v;
 }
+// ---------- Ordena: recado no chat com você mesmo que termina com um valor ("almoço 50") vira lançamento ----------
+// Só olha o chat consigo mesmo; o Ordena confere este mesmo API_TOKEN e responde com a confirmação, que volta para esse chat.
+const ORDENA_URL = process.env.ORDENA_LANCAR_URL || 'https://tttquxpexueghwxtmcrl.supabase.co/functions/v1/lembretes';
+function pareceLancamentoOrdena(texto) {
+  const t = String(texto || '').trim();
+  if (!t || t.length > 120 || t.includes('\n')) return false;
+  return /^desfazer\.?$/i.test(t) || /\d/.test(t);   // quem decide se é lançamento é o Ordena; o resto é ignorado em silêncio
+}
+async function encaminharOrdena(phone, texto) {
+  if (!ORDENA_URL || !API_TOKEN) return;
+  try {
+    const r = await fetch(ORDENA_URL, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-token': API_TOKEN }, body: JSON.stringify({ acao: 'whats-lancar', phone, texto }) });
+    const j = await r.json().catch(() => ({}));
+    if (j && j.resposta && isConnected && sock) guardarMensagem(await sock.sendMessage(toWhatsAppJid(phone), { text: String(j.resposta).slice(0, 1000) }));
+  } catch (e) { console.warn('[ordena] não deu para lançar:', e.message); }
+}
+
 async function enviarAlerta(texto) {
   if (!SUPABASE_KEY || !PROSPECTA_USER_ID) return false;
   const num = await numeroAlerta();
