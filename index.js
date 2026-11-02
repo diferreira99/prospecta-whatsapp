@@ -593,7 +593,7 @@ async function startSock() {
   // ---------- Mensagens novas (só escuta e registra, NUNCA responde nada automaticamente) ----------
   // Encaminha pro n8n: telefone + texto + horário. O n8n decide se parece auto-resposta
   // (URA/robô do WhatsApp Business do próprio lead) e grava tudo no Supabase.
-  // Este listener NUNCA chama sock.sendMessage — não existe resposta automática aqui.
+  // Este listener NUNCA responde lead. A única resposta é a do copiloto, e só para o número de alerta do próprio dono.
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     for (const msg of messages) {
       try {
@@ -645,6 +645,9 @@ async function startSock() {
         }
 
         const timestampMs = (msg.messageTimestamp ? Number(msg.messageTimestamp) : Math.floor(Date.now() / 1000)) * 1000;
+
+        // Mensagem do seu número de alerta = pergunta para o copiloto (não é resposta de lead)
+        if (await ehDono(phone)) { copiloto(phone, texto).catch(e => console.warn('[copiloto]', e.message)); continue; }
 
         if (!N8N_WEBHOOK_RESPOSTA || !PROSPECTA_USER_ID) {
           console.warn('[mensagem recebida] N8N_WEBHOOK_RESPOSTA ou PROSPECTA_USER_ID não configurados — não encaminhada.');
@@ -1266,6 +1269,122 @@ app.post('/logout', checkAuth, async (req, res) => {
 // O app do cliente não tem mais a chave da IA: pede o texto aqui e o servidor chama a OpenAI/Gemini
 // com a chave que o administrador gravou no banco (user_config).
 let _iaCfg = null, _iaCfgEm = 0;
+// ---------- Copiloto pelo WhatsApp ----------
+// Do seu número de alerta (o pessoal, cadastrado em Integrações) você manda texto ou áudio para o número da prospecção:
+// "o que tenho hoje?", "move a Padaria Sol para negociação", "nota na Padaria Sol: ligar sexta", "quem é a Padaria Sol?".
+// Só responde ao próprio dono; mensagem de lead nunca recebe resposta automática.
+async function ehDono(phone) {
+  try { const n = await numeroAlerta(); return !!n && n.length >= 10 && chaveTel(n) === chaveTel(phone); } catch (e) { return false; }
+}
+async function iaTexto(prompt, maxTokens) {
+  const cfg = await iaConfig();
+  if (cfg.openai_key) {
+    const r = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.openai_key}` },
+      body: JSON.stringify({ model: 'gpt-4o-mini', max_tokens: maxTokens || 300, messages: [{ role: 'user', content: prompt }] }) });
+    if (!r.ok) throw new Error('OpenAI ' + r.status);
+    return ((await r.json()).choices?.[0]?.message?.content || '').trim();
+  }
+  if (cfg.gemini_key) {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(cfg.gemini_key)}`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }] }) });
+    if (!r.ok) throw new Error('Gemini ' + r.status);
+    return ((await r.json()).candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+  }
+  throw new Error('IA não configurada');
+}
+const ETAPAS_PIPE = { novo: 'Novo', contatado: 'Contatado', respondeu: 'Respondeu', negociando: 'Negociando', fechado: 'Ganho', descartado: 'Perdido' };
+function etapaDe(t) {
+  const x = String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  if (/negoci/.test(x)) return 'negociando'; if (/ganh|fech|vend/.test(x)) return 'fechado'; if (/perd|descart/.test(x)) return 'descartado';
+  if (/respond/.test(x)) return 'respondeu'; if (/contat/.test(x)) return 'contatado'; if (/novo/.test(x)) return 'novo';
+  return '';
+}
+async function copilotoEntender(texto) {
+  const t = String(texto || '').replace(/^🎤 Áudio: "|"$/g, '').trim();
+  const x = t.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  if (/^(oi|ola|ajuda|menu|comandos|\?)\W*$/.test(x)) return { acao: 'ajuda' };
+  if (/\b(hoje|meu dia|o que (eu )?tenho|resumo|pendenc)/.test(x) && !/\bmov|nota\b/.test(x)) return { acao: 'hoje' };
+  let m = x.match(/^(?:move|mover|mova|passa|passar|coloca|colocar)\s+(?:o |a |os |as )?(.+?)\s+(?:para|pra|pro|na|no|em)\s+(?:a |o )?(\w+)/);
+  if (m && etapaDe(m[2])) return { acao: 'mover', lead: t.slice(x.indexOf(m[1]), x.indexOf(m[1]) + m[1].length), etapa: etapaDe(m[2]) };
+  m = t.match(/^nota\s+(?:na|no|para|pra|em)?\s*(.+?)\s*:\s*(.+)$/i);
+  if (m) return { acao: 'nota', lead: m[1], texto: m[2] };
+  try {
+    const j = await iaTexto('Você interpreta um pedido do vendedor sobre o CRM dele. Pedido: "' + t.slice(0, 500) + '"\nResponda só com JSON: {"acao":"hoje|mover|nota|quem|ajuda","lead":"nome da empresa citada ou vazio","etapa":"novo|contatado|respondeu|negociando|fechado|descartado ou vazio","texto":"a anotação, se for nota"}', 150);
+    const o = JSON.parse((j.match(/\{[\s\S]*\}/) || ['{}'])[0]);
+    if (o.acao === 'mover' && !ETAPAS_PIPE[o.etapa]) o.etapa = etapaDe(o.etapa);
+    return o;
+  } catch (e) { return { acao: 'ajuda' }; }
+}
+async function copilotoAcharLead(nome) {
+  const n = String(nome || '').replace(/[%*,()]/g, ' ').trim();
+  if (n.length < 2) return [];
+  return (await supa('GET', `pipeline_leads?user_id=eq.${PROSPECTA_USER_ID}&name=ilike.*${encodeURIComponent(n)}*&select=id,name,phone,col,nota,proxima_acao_txt,proxima_acao_em,reuniao_em,valor&order=moved_at.desc&limit=5`)) || [];
+}
+function dataCurtaSP(iso) { return iso ? new Date(iso).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : ''; }
+async function copilotoHoje() {
+  const u = PROSPECTA_USER_ID, iniSP = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' })); iniSP.setHours(0, 0, 0, 0);
+  const off = Date.now() - new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' })).getTime();
+  const ini = new Date(iniSP.getTime() + off).toISOString(), fim = new Date(iniSP.getTime() + off + 86400000).toISOString(), d7 = new Date(Date.now() - 7 * 86400000).toISOString();
+  const conta = async q => { try { const r = await fetch(`${SUPABASE_URL}/rest/v1/${q}&select=id`, { method: 'HEAD', headers: supaHeaders({ Prefer: 'count=exact', Range: '0-0' }) }); return Number((r.headers.get('content-range') || '/0').split('/')[1]) || 0; } catch (e) { return 0; } };
+  const [ints, sugs, fus, neg, envios] = await Promise.all([
+    conta(`fila_sugestoes?user_id=eq.${u}&status=eq.pendente&classificacao=in.(quente,duvida)`),
+    conta(`fila_sugestoes?user_id=eq.${u}&status=eq.pendente`),
+    conta(`fila_followups?user_id=eq.${u}&status=eq.pendente`),
+    conta(`pipeline_leads?user_id=eq.${u}&col=eq.negociando&moved_at=lt.${d7}`),
+    conta(`leads?user_id=eq.${u}&enviado_em=gte.${ini}&enviado_em=lt.${fim}`),
+  ]);
+  let reunioes = [];
+  try { reunioes = (await supa('GET', `pipeline_leads?user_id=eq.${u}&reuniao_em=gte.${ini}&reuniao_em=lt.${fim}&select=name,reuniao_em&order=reuniao_em.asc&limit=5`)) || []; } catch (e) {}
+  const linhas = ['📋 *Seu dia no Prospecta+*'];
+  linhas.push(ints ? `🔥 ${ints} interessado(s) esperando resposta` : '✅ Nenhum interessado esperando');
+  if (sugs > ints) linhas.push(`💬 ${sugs - ints} outra(s) resposta(s) para aprovar`);
+  if (fus) linhas.push(`📤 ${fus} follow-up(s) para aprovar`);
+  if (neg) linhas.push(`⏳ ${neg} negociação(ões) parada(s) há 7+ dias`);
+  reunioes.forEach(r => linhas.push(`📅 ${dataCurtaSP(r.reuniao_em).slice(-5)} · ${r.name}`));
+  linhas.push(`📨 ${envios} envio(s) de campanha hoje` + (isConnected ? '' : ' · ⚠️ WhatsApp desconectado'));
+  return linhas.join('\n');
+}
+async function copiloto(phone, texto) {
+  if (!SUPABASE_KEY || !PROSPECTA_USER_ID) return;
+  const o = await copilotoEntender(texto);
+  let resp = '';
+  if (o.acao === 'hoje') resp = await copilotoHoje();
+  else if (o.acao === 'mover' || o.acao === 'nota' || o.acao === 'quem') {
+    const achados = await copilotoAcharLead(o.lead);
+    if (!achados.length) resp = `Não achei "${o.lead || ''}" no Pipeline. Escreva o nome como está no card.`;
+    else if (achados.length > 1 && !achados.some(a => a.name.toLowerCase() === String(o.lead).toLowerCase())) resp = 'Achei mais de um:\n' + achados.map(a => `• ${a.name} (${ETAPAS_PIPE[a.col] || a.col})`).join('\n') + '\nMande de novo com o nome completo.';
+    else {
+      const l = achados.find(a => a.name.toLowerCase() === String(o.lead).toLowerCase()) || achados[0];
+      if (o.acao === 'mover') {
+        if (!ETAPAS_PIPE[o.etapa]) resp = 'Para qual etapa? Novo, Contatado, Respondeu, Negociando, Ganho ou Perdido.';
+        else {
+          const agora = new Date().toISOString();
+          const patch = { col: o.etapa, moved_at: agora };
+          if (o.etapa === 'fechado') patch.fechado_em = agora;
+          if (o.etapa === 'fechado' || o.etapa === 'descartado') { patch.proxima_acao_em = null; patch.proxima_acao_txt = null; }
+          if (o.etapa === 'descartado') patch.motivo_perda = 'outro';
+          await supa('PATCH', `pipeline_leads?user_id=eq.${PROSPECTA_USER_ID}&id=eq.${encodeURIComponent(l.id)}`, patch);
+          resp = `✅ ${l.name} → ${ETAPAS_PIPE[o.etapa]}`;
+        }
+      } else if (o.acao === 'nota') {
+        const carimbo = new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+        const nota = ((l.nota ? l.nota + '\n' : '') + `[${carimbo}] ${String(o.texto || '').trim()}`).slice(-4000);
+        await supa('PATCH', `pipeline_leads?user_id=eq.${PROSPECTA_USER_ID}&id=eq.${encodeURIComponent(l.id)}`, { nota, moved_at: new Date().toISOString() });
+        resp = `📝 Nota salva em ${l.name}.`;
+      } else {
+        resp = `👤 *${l.name}*\nEtapa: ${ETAPAS_PIPE[l.col] || l.col}` + (l.valor ? `\nValor: R$ ${Number(l.valor).toLocaleString('pt-BR')}` : '') +
+          (l.reuniao_em ? `\nReunião: ${dataCurtaSP(l.reuniao_em)}` : '') + (l.proxima_acao_txt ? `\nPróximo passo: ${l.proxima_acao_txt}` + (l.proxima_acao_em ? ' (' + dataCurtaSP(l.proxima_acao_em).slice(0, 5) + ')' : '') : '') +
+          (l.nota ? `\nÚltima nota: ${String(l.nota).split('\n').pop().slice(0, 200)}` : '') + (l.phone ? `\nhttps://wa.me/${String(l.phone).replace(/\D/g, '')}` : '');
+      }
+    }
+  } else {
+    resp = '🤖 *Copiloto do Prospecta+*\nMande por texto ou áudio:\n• *hoje* → o que precisa de você\n• *move Padaria Sol para negociando*\n• *nota na Padaria Sol: ligar sexta 10h*\n• *quem é a Padaria Sol?*';
+  }
+  if (!resp || !isConnected || !sock) return;
+  const enviada = await emFila(async () => sock.sendMessage(toWhatsAppJid(phone), { text: resp.slice(0, 1500) }));
+  guardarMensagem(enviada);
+}
+
 async function iaConfig() {
   if (_iaCfg && Date.now() - _iaCfgEm < 60 * 1000) return _iaCfg;
   const rows = await supa('GET', `user_config?user_id=eq.${PROSPECTA_USER_ID}&select=ia_provider,openai_key,gemini_key`);
