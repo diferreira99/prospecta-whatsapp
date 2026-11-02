@@ -1081,6 +1081,84 @@ app.get('/qr', checkAuth, async (req, res) => {
   `);
 });
 
+// ---------- Pesquisa da empresa: texto do site e dados do CNPJ ----------
+// Lê o site público da empresa (só http/https, sem endereço interno) e devolve o texto limpo e os CNPJs que aparecem nele.
+const dnsP = require('dns').promises, netMod = require('net');
+function ipInterno(ip) {
+  if (netMod.isIPv6(ip)) { const v = ip.toLowerCase(); if (v.startsWith('::ffff:')) return ipInterno(v.slice(7)); return v === '::1' || v === '::' || v.startsWith('fc') || v.startsWith('fd') || v.startsWith('fe80'); }
+  const [a, b] = ip.split('.').map(Number);
+  return a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
+}
+async function urlSegura(u) {
+  let url; try { url = new URL(/^https?:\/\//i.test(u) ? u : 'https://' + u); } catch (e) { return null; }
+  if (!/^https?:$/.test(url.protocol) || url.username || url.password) return null;
+  if (url.port && !['80', '443'].includes(url.port)) return null;
+  try { const ips = await dnsP.lookup(url.hostname, { all: true }); if (!ips.length || ips.some(x => ipInterno(x.address))) return null; } catch (e) { return null; }
+  return url;
+}
+function htmlParaTexto(html) {
+  return String(html || '')
+    .replace(/<(script|style|noscript|svg|iframe)[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<br\s*\/?>|<\/(p|div|li|h\d|section|footer|header)>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&#(\d+);/g, (_, n) => { try { return String.fromCodePoint(Number(n)); } catch (e) { return ' '; } })
+    .replace(/[ \t\r\f\v]+/g, ' ').replace(/\s*\n\s*/g, '\n').replace(/\n{2,}/g, '\n').trim();
+}
+function cnpjsNoTexto(t) {
+  const out = new Set();
+  (String(t).match(/\b\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}\b/g) || []).forEach(c => { const d = c.replace(/\D/g, ''); if (d.length === 14 && cnpjValido(d)) out.add(d); });
+  return [...out].slice(0, 3);
+}
+function cnpjValido(d) {
+  if (!/^\d{14}$/.test(d) || /^(\d)\1+$/.test(d)) return false;
+  const dv = n => { const pesos = n === 12 ? [5,4,3,2,9,8,7,6,5,4,3,2] : [6,5,4,3,2,9,8,7,6,5,4,3,2]; const s = pesos.reduce((a, p, i) => a + Number(d[i]) * p, 0) % 11; return s < 2 ? 0 : 11 - s; };
+  return dv(12) === Number(d[12]) && dv(13) === Number(d[13]);
+}
+app.post('/site-texto', checkAuth, async (req, res) => {
+  try {
+    let url = await urlSegura(String(req.body?.url || '').trim());
+    if (!url) return res.status(400).json({ error: 'Endereço de site inválido.' });
+    let r, saltos = 0;
+    while (true) {
+      const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 8000);
+      r = await fetch(url, { redirect: 'manual', signal: ctl.signal, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProspectaBot/1.0)', 'Accept': 'text/html' } }).finally(() => clearTimeout(t));
+      if (r.status >= 300 && r.status < 400 && r.headers.get('location') && saltos < 3) { saltos++; url = await urlSegura(new URL(r.headers.get('location'), url).href); if (!url) return res.status(400).json({ error: 'O site redireciona para um endereço não permitido.' }); continue; }
+      break;
+    }
+    if (!r.ok) return res.status(502).json({ error: 'O site respondeu ' + r.status + '.' });
+    if (!/html|text/i.test(r.headers.get('content-type') || 'text/html')) return res.status(415).json({ error: 'O endereço não é uma página.' });
+    const buf = Buffer.from(await r.arrayBuffer()).subarray(0, 1500000).toString('utf8');
+    const titulo = ((buf.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    const descricao = ((buf.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)/i) || [])[1] || '').trim().slice(0, 400);
+    const texto = htmlParaTexto(buf);
+    res.json({ url: url.href, titulo, descricao, texto: texto.slice(0, 5000), cnpjs: cnpjsNoTexto(texto) });
+  } catch (e) { res.status(502).json({ error: e.name === 'AbortError' ? 'O site demorou demais para responder.' : 'Não consegui ler o site.' }); }
+});
+// Dados públicos do CNPJ (Receita, via BrasilAPI): sócios, porte, abertura, atividade
+const _cnpjCache = new Map();
+app.get('/cnpj', checkAuth, async (req, res) => {
+  const d = String(req.query.n || '').replace(/\D/g, '');
+  if (!cnpjValido(d)) return res.status(400).json({ error: 'CNPJ inválido.' });
+  try {
+    if (_cnpjCache.has(d)) return res.json(_cnpjCache.get(d));
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 10000);
+    const r = await fetch('https://brasilapi.com.br/api/cnpj/v1/' + d, { signal: ctl.signal }).finally(() => clearTimeout(t));
+    if (r.status === 404) return res.status(404).json({ error: 'CNPJ não encontrado na Receita.' });
+    if (!r.ok) return res.status(502).json({ error: 'A consulta do CNPJ falhou (' + r.status + ').' });
+    const j = await r.json();
+    const out = {
+      cnpj: d, razao_social: j.razao_social || '', nome_fantasia: j.nome_fantasia || '', situacao: j.descricao_situacao_cadastral || '',
+      abertura: j.data_inicio_atividade || '', porte: j.porte || j.descricao_porte || '', capital_social: j.capital_social || null,
+      atividade: j.cnae_fiscal_descricao || '', municipio: j.municipio || '', uf: j.uf || '',
+      socios: (j.qsa || []).slice(0, 6).map(s => ({ nome: s.nome_socio || s.nome || '', qualificacao: s.qualificacao_socio || '' })),
+    };
+    if (_cnpjCache.size > 500) _cnpjCache.clear();
+    _cnpjCache.set(d, out);
+    res.json(out);
+  } catch (e) { res.status(502).json({ error: e.name === 'AbortError' ? 'A consulta do CNPJ demorou demais.' : 'Não consegui consultar o CNPJ.' }); }
+});
+
 app.get('/status', checkAuth, (req, res) => {
   if (enviosHoje.dia !== diaSP()) enviosHoje = { dia: diaSP(), n: 0 };
   res.json({
