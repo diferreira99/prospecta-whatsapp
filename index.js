@@ -1145,20 +1145,43 @@ app.get('/cnpj', checkAuth, async (req, res) => {
   if (!cnpjValido(d)) return res.status(400).json({ error: 'CNPJ inválido.' });
   try {
     if (_cnpjCache.has(d)) return res.json(_cnpjCache.get(d));
-    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 10000);
-    const r = await fetch('https://brasilapi.com.br/api/cnpj/v1/' + d, { signal: ctl.signal }).finally(() => clearTimeout(t));
-    if (r.status === 404) return res.status(404).json({ error: 'CNPJ não encontrado na Receita.' });
-    if (!r.ok) return res.status(502).json({ error: 'A consulta do CNPJ falhou (' + r.status + ').' });
-    const j = await r.json();
-    const out = {
-      cnpj: d, razao_social: j.razao_social || '', nome_fantasia: j.nome_fantasia || '', situacao: j.descricao_situacao_cadastral || '',
-      abertura: j.data_inicio_atividade || '', porte: j.porte || j.descricao_porte || '', capital_social: j.capital_social || null,
-      atividade: j.cnae_fiscal_descricao || '', municipio: j.municipio || '', uf: j.uf || '',
-      socios: (j.qsa || []).slice(0, 6).map(s => ({ nome: s.nome_socio || s.nome || '', qualificacao: s.qualificacao_socio || '' })),
-      // contato que a própria empresa declarou na Receita (em empresa pequena costuma ser o celular do dono)
-      telefones: [j.ddd_telefone_1, j.ddd_telefone_2].map(t => String(t || '').replace(/\D/g, '')).filter(t => t.length >= 10 && t.length <= 11),
-      email: String(j.email || '').toLowerCase().trim(),
-    };
+    const pegar = async url => { const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 10000); try { return await fetch(url, { signal: ctl.signal, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProspectaBot/1.0)', Accept: 'application/json' } }); } finally { clearTimeout(t); } };
+    let out = null, motivo = '';
+    // 1ª fonte: BrasilAPI
+    try {
+      const r = await pegar('https://brasilapi.com.br/api/cnpj/v1/' + d);
+      if (r.status === 404) return res.status(404).json({ error: 'CNPJ não encontrado na Receita.' });
+      if (r.ok) {
+        const j = await r.json();
+        out = {
+          cnpj: d, razao_social: j.razao_social || '', nome_fantasia: j.nome_fantasia || '', situacao: j.descricao_situacao_cadastral || '',
+          abertura: j.data_inicio_atividade || '', porte: j.porte || j.descricao_porte || '', capital_social: j.capital_social || null,
+          atividade: j.cnae_fiscal_descricao || '', municipio: j.municipio || '', uf: j.uf || '',
+          socios: (j.qsa || []).slice(0, 6).map(s => ({ nome: s.nome_socio || s.nome || '', qualificacao: s.qualificacao_socio || '' })),
+          // contato que a própria empresa declarou na Receita (em empresa pequena costuma ser o celular do dono)
+          telefones: [j.ddd_telefone_1, j.ddd_telefone_2].map(t => String(t || '').replace(/\D/g, '')).filter(t => t.length >= 10 && t.length <= 11),
+          email: String(j.email || '').toLowerCase().trim(), fonte_receita: 'brasilapi',
+        };
+      } else motivo = 'BrasilAPI ' + r.status;
+    } catch (e) { motivo = 'BrasilAPI ' + (e.name === 'AbortError' ? 'demorou' : e.message); }
+    // 2ª fonte (se a 1ª bloquear ou cair): CNPJ.ws público
+    if (!out) {
+      try {
+        const r = await pegar('https://publica.cnpj.ws/cnpj/' + d);
+        if (r.status === 404) return res.status(404).json({ error: 'CNPJ não encontrado na Receita.' });
+        if (!r.ok) return res.status(502).json({ error: 'A consulta do CNPJ falhou (' + motivo + ' · CNPJ.ws ' + r.status + ').' });
+        const j = await r.json(), e = j.estabelecimento || {};
+        const tel = (ddd, n) => String((ddd || '') + (n || '')).replace(/\D/g, '');
+        out = {
+          cnpj: d, razao_social: j.razao_social || '', nome_fantasia: e.nome_fantasia || '', situacao: e.situacao_cadastral || '',
+          abertura: e.data_inicio_atividade || '', porte: (j.porte && j.porte.descricao) || '', capital_social: j.capital_social || null,
+          atividade: (e.atividade_principal && e.atividade_principal.descricao) || '', municipio: (e.cidade && e.cidade.nome) || '', uf: (e.estado && e.estado.sigla) || '',
+          socios: (j.socios || []).slice(0, 6).map(s => ({ nome: s.nome || '', qualificacao: (s.qualificacao_socio && s.qualificacao_socio.descricao) || '' })),
+          telefones: [tel(e.ddd1, e.telefone1), tel(e.ddd2, e.telefone2)].filter(t => t.length >= 10 && t.length <= 11),
+          email: String(e.email || '').toLowerCase().trim(), fonte_receita: 'cnpjws',
+        };
+      } catch (e) { return res.status(502).json({ error: 'A consulta do CNPJ falhou (' + motivo + ' · CNPJ.ws ' + (e.name === 'AbortError' ? 'demorou' : e.message) + ').' }); }
+    }
     if (_cnpjCache.size > 500) _cnpjCache.clear();
     _cnpjCache.set(d, out);
     res.json(out);
