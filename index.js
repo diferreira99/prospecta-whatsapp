@@ -871,8 +871,34 @@ async function resumoDoDia() {
     await enviarAlerta(linhas.join('\n'));
   } catch (e) { console.warn('[alertas] resumo do dia falhou:', e.message); }
 }
+// O que o LinkedIn e o Instagram pedem hoje (o app não lê os dois: são as tarefas que ele preparou)
+async function pendenciasCanais() {
+  const u = PROSPECTA_USER_ID, agora = new Date().toISOString(), d2 = new Date(Date.now() - 2 * 86400000).toISOString(), d3 = new Date(Date.now() - 3 * 86400000).toISOString();
+  const conta = async q => { try { const r = await fetch(`${SUPABASE_URL}/rest/v1/${q}&select=id`, { method: 'HEAD', headers: supaHeaders({ Prefer: 'count=exact', Range: '0-0' }) }); return Number((r.headers.get('content-range') || '/0').split('/')[1]) || 0; } catch (e) { return 0; } };
+  const [aceites, msgs, igRet] = await Promise.all([
+    conta(`abordagens_linkedin?user_id=eq.${u}&aceito_em=is.null&resultado=is.null&criado_em=lt.${d2}`),
+    conta(`abordagens_linkedin?user_id=eq.${u}&aceito_em=not.is.null&resultado=is.null&proxima_em=lte.${agora}`),
+    conta(`abordagens_instagram?user_id=eq.${u}&resultado=is.null&retomado_em=is.null&criado_em=lt.${d3}`),
+  ]);
+  return { aceites, msgs, igRet };
+}
+// Aviso da manhã (dias úteis, 8h): chega no seu WhatsApp de alertas mesmo com o app fechado.
+// Desliga no app (Prospecção LinkedIn → "aviso da manhã") — fica em user_data.dados.aviso_manha.
+async function avisoDaManha() {
+  if (!SUPABASE_KEY || !PROSPECTA_USER_ID) return;
+  const agora = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' }));
+  const est = lerAlertasEstado();
+  if (agora.getDay() === 0 || agora.getDay() === 6 || agora.getHours() !== 8 || est.manha === diaSP()) return;
+  est.manha = diaSP(); salvarAlertasEstado();
+  try {
+    const r = await supa('GET', `user_data?user_id=eq.${encodeURIComponent(PROSPECTA_USER_ID)}&select=aviso:dados->aviso_manha&limit=1`);
+    if (r && r[0] && r[0].aviso === false) return;
+  } catch (e) {}
+  try { await enviarAlerta('☀️ *Bom dia!*\n' + (await copilotoHoje()).replace(/^📋 \*Seu dia no Prospecta\+\*\n/, '') + '\n\nAbra o app e toque em ▶ Começar a rotina.'); }
+  catch (e) { console.warn('[alertas] aviso da manhã falhou:', e.message); }
+}
 const ALERTAS_INTERVALO_MS = parseInt(process.env.ALERTAS_INTERVALO_MS, 10) || 2 * 60 * 1000;
-setInterval(() => { verificarCampanhas().catch(() => {}); resumoDoDia().catch(() => {}); }, ALERTAS_INTERVALO_MS).unref();
+setInterval(() => { verificarCampanhas().catch(() => {}); resumoDoDia().catch(() => {}); avisoDaManha().catch(() => {}); }, ALERTAS_INTERVALO_MS).unref();
 setTimeout(() => verificarCampanhas().catch(() => {}), Math.min(20000, ALERTAS_INTERVALO_MS)).unref();
 
 // ---------- Proteção da conta (configurada em Integrações → 🛡️ Proteção da conta) ----------
@@ -1367,6 +1393,12 @@ async function copilotoHoje() {
   if (fus) linhas.push(`📤 ${fus} follow-up(s) para aprovar`);
   if (neg) linhas.push(`⏳ ${neg} negociação(ões) parada(s) há 7+ dias`);
   reunioes.forEach(r => linhas.push(`📅 ${dataCurtaSP(r.reuniao_em).slice(-5)} · ${r.name}`));
+  try {
+    const c = await pendenciasCanais();
+    if (c.msgs) linhas.push(`💼 ${c.msgs} mensagem(ns) do LinkedIn (quem já aceitou)`);
+    if (c.aceites) linhas.push(`🤝 ${c.aceites} convite(s) do LinkedIn para ver se aceitou`);
+    if (c.igRet) linhas.push(`📸 ${c.igRet} retomada(s) no Instagram`);
+  } catch (e) {}
   linhas.push(`📨 ${envios} envio(s) de campanha hoje` + (isConnected ? '' : ' · ⚠️ WhatsApp desconectado'));
   return linhas.join('\n');
 }
