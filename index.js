@@ -1155,6 +1155,9 @@ app.get('/cnpj', checkAuth, async (req, res) => {
       abertura: j.data_inicio_atividade || '', porte: j.porte || j.descricao_porte || '', capital_social: j.capital_social || null,
       atividade: j.cnae_fiscal_descricao || '', municipio: j.municipio || '', uf: j.uf || '',
       socios: (j.qsa || []).slice(0, 6).map(s => ({ nome: s.nome_socio || s.nome || '', qualificacao: s.qualificacao_socio || '' })),
+      // contato que a própria empresa declarou na Receita (em empresa pequena costuma ser o celular do dono)
+      telefones: [j.ddd_telefone_1, j.ddd_telefone_2].map(t => String(t || '').replace(/\D/g, '')).filter(t => t.length >= 10 && t.length <= 11),
+      email: String(j.email || '').toLowerCase().trim(),
     };
     if (_cnpjCache.size > 500) _cnpjCache.clear();
     _cnpjCache.set(d, out);
