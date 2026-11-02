@@ -19,6 +19,7 @@
  *   SUPABASE_SERVICE_KEY -> grava LID, status da conexão, entregas/leituras e o que você digita no celular
  *   LIMITE_DIARIO_SERVIDOR -> teto de mensagens por dia neste número (padrão 150; trava de segurança)
  *   INTERVALO_MINIMO_MS  -> intervalo mínimo entre duas mensagens (padrão 3000)
+ *   INTERVALO_FRIO_MS    -> intervalo mínimo entre mensagens para quem não te escreveu em 24 h (padrão 30000)
  */
 
 // Polyfill: versões recentes do Baileys usam a API global `crypto` (WebCrypto),
@@ -120,6 +121,11 @@ const PROSPECTA_USER_ID = process.env.PROSPECTA_USER_ID || ''; // UUID do usuár
 // Trava de segurança do próprio servidor (além do limite diário do n8n)
 const LIMITE_DIARIO_SERVIDOR = parseInt(process.env.LIMITE_DIARIO_SERVIDOR, 10) || 150;
 const INTERVALO_MINIMO_MS = parseInt(process.env.INTERVALO_MINIMO_MS, 10) || 3000;
+// Freio de mensagem fria: para quem não te escreveu nas últimas 24 h, no máximo 1 mensagem a cada 30 s (+ até 5 s ao acaso),
+// venha de onde vier (campanha, follow-up, áudio). Resposta para quem está conversando com você sai na hora.
+// Rajada é o que derruba o número (em 19/10 saíram 5 no mesmo segundo e o WhatsApp desconectou).
+const INTERVALO_FRIO_MS = parseInt(process.env.INTERVALO_FRIO_MS, 10) || 30000;
+const ESPERA_MAX_FRIO_MS = 150000;   // além disso o envio é recusado (429) em vez de ficar pendurado
 
 // Mapeamento LID ↔ telefone: essa versão do Baileys nem sempre traduz @lid sozinha quando a
 // resposta chega, então guardamos essa tradução ANTES, no momento do envio (quando já
@@ -626,6 +632,7 @@ async function startSock() {
           continue;
         }
 
+        marcarRecebida(phone);
         const lida = lerMensagem(msg);
         if (!lida) continue;                                        // reação, aviso do sistema etc.
         let texto = lida.texto;
@@ -989,6 +996,33 @@ function dentroDoTeto() {
   if (enviosHoje.dia !== diaSP()) enviosHoje = { dia: diaSP(), n: 0 };
   return enviosHoje.n < LIMITE_DIARIO_SERVIDOR;
 }
+// Quem escreveu para você recentemente (chave: últimos 8 dígitos do telefone)
+const _recebidaEm = new Map();
+function chaveTel(t) { return String(t || '').replace(/\D/g, '').slice(-8); }
+function marcarRecebida(phone) { const k = chaveTel(phone); if (k.length === 8) _recebidaEm.set(k, Date.now()); }
+function emConversa(phone) { const t = _recebidaEm.get(chaveTel(phone)); return !!t && Date.now() - t < 24 * 3600000; }
+let ultimoFrio = 0, filaFria = Promise.resolve(), _friosNaFila = 0;
+function esperaFria() { return Math.max(0, ultimoFrio + INTERVALO_FRIO_MS - Date.now()) + _friosNaFila * (INTERVALO_FRIO_MS * 13 / 12); }
+// Mensagem fria passa primeiro por esta fila (30 s entre elas) e depois pela fila geral
+function emFilaFria(tarefa) {
+  _friosNaFila++;
+  const proxima = filaFria.then(async () => {
+    const espera = ultimoFrio + INTERVALO_FRIO_MS * (1 + Math.random() / 6) - Date.now();
+    if (espera > 0) await new Promise(r => setTimeout(r, espera));
+    try { return await emFila(tarefa); } finally { ultimoFrio = Date.now(); _friosNaFila--; }
+  });
+  filaFria = proxima.catch(() => {});
+  return proxima;
+}
+// Escolhe a fila certa; recusa (null) se a fila fria já está longa demais
+function filaPara(phone, tarefa) {
+  if (emConversa(phone)) return emFila(tarefa);
+  if (esperaFria() > ESPERA_MAX_FRIO_MS) return null;
+  return emFilaFria(tarefa);
+}
+function recusaRitmo(res) {
+  return res.status(429).json({ error: `Fila de envio cheia: espere uns ${Math.ceil(esperaFria() / 60000)} min. O servidor solta no máximo 1 mensagem a cada ${Math.round(INTERVALO_FRIO_MS / 1000)} s para quem não está conversando com você (proteção do número).`, codigo: 'ritmo' });
+}
 // Um envio por vez, com intervalo mínimo entre eles (evita rajada se algo disparar em dobro)
 function emFila(tarefa) {
   const proxima = filaEnvio.then(async () => {
@@ -1277,7 +1311,7 @@ app.post('/send-message', checkAuth, async (req, res) => {
     const destino = jid;
 
     const digitando = Math.max(0, Math.min(20000, parseInt(req.body.digitandoMs, 10) || 0));
-    const enviada = await emFila(async () => {
+    const naFila = filaPara(phone, async () => {
       if (digitando) {
         try {
           await sock.presenceSubscribe(destino).catch(() => {});
@@ -1290,6 +1324,8 @@ app.post('/send-message', checkAuth, async (req, res) => {
       enviosHoje.n++;
       return m;
     });
+    if (!naFila) return recusaRitmo(res);
+    const enviada = await naFila;
     guardarMensagem(enviada);
     registrarEnvio(enviada, String(phone).replace(/\D/g, ''));
     res.json({ success: true, phone, jid: destino, id: enviada?.key?.id || null });
@@ -1341,10 +1377,11 @@ app.post('/send-audio', checkAuth, async (req, res) => {
     if (!(await aguardarConexao(15000))) return res.status(503).json({ error: 'WhatsApp não conectado.', codigo: 'desconectado' });
     if (!dentroDoTeto()) return res.status(429).json({ error: `Limite de segurança do servidor atingido (${LIMITE_DIARIO_SERVIDOR} mensagens hoje).`, codigo: 'teto_diario' });
     try { const r = await sock.onWhatsApp(jid); if (Array.isArray(r) && r.length === 0) return res.status(404).json({ error: 'Este número não tem WhatsApp.', codigo: 'sem_whatsapp' }); } catch (e) {}
+    if (!emConversa(phone) && esperaFria() > ESPERA_MAX_FRIO_MS) return recusaRitmo(res);   // antes de gastar com a voz
     const audio = await gerarAudio(req.body?.texto, req.body?.voz);
     // "gravando áudio…" por um tempo proporcional ao texto, como uma pessoa gravando
     const gravando = Math.min(12000, 2500 + String(req.body?.texto || '').length * 25);
-    const enviada = await emFila(async () => {
+    const naFila = filaPara(phone, async () => {
       try {
         await sock.presenceSubscribe(jid).catch(() => {});
         await sock.sendPresenceUpdate('recording', jid);
@@ -1355,6 +1392,8 @@ app.post('/send-audio', checkAuth, async (req, res) => {
       enviosHoje.n++;
       return m;
     });
+    if (!naFila) return recusaRitmo(res);
+    const enviada = await naFila;
     guardarMensagem(enviada);
     registrarEnvio(enviada, String(phone).replace(/\D/g, ''));
     console.log('[áudio] enviado para final ' + String(phone).replace(/\D/g, '').slice(-4) + ` (${Math.round(audio.length / 1024)} KB)`);
@@ -1407,7 +1446,10 @@ app.post('/send-document', checkAuth, async (req, res) => {
       payload = { document: buffer, fileName: filename || 'arquivo', mimetype: mimetype || 'application/octet-stream', caption: caption || '' };
     }
 
-    const enviada = await emFila(async () => { const m = await sock.sendMessage(jid, payload); enviosHoje.n++; return m; });
+    const tarefa = async () => { const m = await sock.sendMessage(jid, payload); enviosHoje.n++; return m; };
+    const naFila = grupoId ? emFila(tarefa) : filaPara(phone, tarefa);
+    if (!naFila) return recusaRitmo(res);
+    const enviada = await naFila;
     guardarMensagem(enviada);
     if (!grupoId) registrarEnvio(enviada, String(phone).replace(/\D/g, ''));
     res.json({ success: true, phone, jid });
